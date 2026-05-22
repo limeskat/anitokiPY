@@ -1,0 +1,14 @@
+[project]
+name = "anitokiPy"
+version = "0.0.1"
+dependencies = [
+    "curl_cffi", 
+    "beautifulsoup4"
+    ]
+readme = "README.md"
+license = "MIT"
+
+[project.scripts]
+anitokipy = "anitokiPy:main"
+
+
