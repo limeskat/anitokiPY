@@ -9,9 +9,20 @@ import signal
 import time
 import re
 import os
+import logging
+from pathlib import Path
 from urllib.parse import urljoin, unquote, urlparse
 from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests as cffi_requests
+
+log_dir = Path.home() / ".local" / "share" / "anitokipy"
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(log_dir / "anitokipy.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("anitokipy")
 
 def is_termux():
     return os.environ.get('TERMUX_VERSION') is not None or os.path.isdir('/data/data/com.termux')
@@ -72,7 +83,7 @@ def safe_input(prompt, max_val=None, allow_zero_back=True):
         except EOFError:
             sys.exit(0)
 
-def stream_in_mpv(download_url):
+def stream_in_mpv(download_url, title=None):
     global session
     cookie_strings = [f"{name}={value}" for name, value in session.cookies.items()]
     cookie_header = "; ".join(cookie_strings)
@@ -96,6 +107,9 @@ def stream_in_mpv(download_url):
             '-t', 'video/*',
             '-p', 'is.xyz.mpv'
         ]
+        if title:
+            am_cmd.extend(['--es', 'title', title])
+        logger.info(f"Launching mpv-android: {' '.join(am_cmd)}")
         subprocess.Popen(
             am_cmd,
             stdout=subprocess.DEVNULL,
@@ -111,6 +125,9 @@ def stream_in_mpv(download_url):
             download_url,
             '--fullscreen'
         ]
+        if title:
+            mpv_flags.append(f'--force-media-title={title}')
+        logger.info(f"Launching mpv: {download_url}")
         subprocess.Popen(
             mpv_flags,
             stdout=subprocess.DEVNULL,
@@ -182,6 +199,70 @@ def fetch_anime_list(anime_search_url):
         return None
     return anime_url[selected_index-1]
 
+def classify_link(url):
+    """Classify a link as cloud folder, direct video, or worker folder."""
+    video_exts = ('.mkv', '.mp4', '.avi', '.webm')
+    parsed = urlparse(url)
+    path_lower = parsed.path.lower()
+    query_lower = parsed.query.lower()
+    
+    if 'cloud.animetoki.com' in parsed.netloc:
+        return 'cloud'
+    
+    # Check if it's a direct video file (path ends with video ext, or has ?a=view)
+    for ext in video_exts:
+        if path_lower.endswith(ext) or f'{ext}?' in path_lower or f'{ext}?' in url.lower():
+            return 'direct_video'
+    if 'a=view' in query_lower:
+        return 'direct_video'
+    
+    # If path ends with / it's a folder on workers.dev or similar
+    if parsed.path.endswith('/'):
+        return 'worker_folder'
+    
+    return 'unknown'
+
+def resolve_stream_url(url):
+    """Convert a ?a=view URL to a direct streamable URL by fetching its file ID via POST."""
+    parsed = urlparse(url)
+    if 'workers.dev' not in parsed.netloc:
+        if parsed.query:
+            from urllib.parse import parse_qs, urlencode
+            params = parse_qs(parsed.query)
+            params.pop('a', None)
+            new_query = urlencode(params, doseq=True)
+            return parsed._replace(query=new_query).geturl()
+        return url
+
+    # For workers.dev links, we must query the parent folder's API
+    path = unquote(parsed.path)
+    if path.endswith('/'):
+        path = path[:-1]
+    
+    parent_path = "/".join(path.split('/')[:-1]) + "/"
+    file_name = path.split('/')[-1]
+    
+    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}?a=view"
+    logger.debug(f"resolve_stream_url: fetching folder API {parent_url}")
+    
+    res = safe_request('post', parent_url)
+    if not res:
+        return url
+        
+    try:
+        data = res.json()
+        for f in data.get('files', []):
+            if f.get('name') == file_name:
+                file_id = f.get('id')
+                encoded_name = encode_2_base64(file_name)
+                stream_url = f"{parsed.scheme}://{parsed.netloc}/?a=download&id={file_id}&name={encoded_name}"
+                logger.debug(f"resolve_stream_url: resolved to {stream_url}")
+                return stream_url
+    except Exception as e:
+        logger.debug(f"resolve_stream_url error: {e}")
+        
+    return url
+
 def anime_download_link(selected_anime_url):
     global base_url
     res_anime = safe_request('get', selected_anime_url)
@@ -193,27 +274,56 @@ def anime_download_link(selected_anime_url):
     if anime_title:
         print(f"> {anime_title.get_text()}")
 
-    links_content = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"]')
-    if not links_content:
+    # Find cloud links (completed anime)
+    cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"]')
+    # Find workers.dev / CDN links (ongoing anime)
+    cdn_links = soup_anime_list.select('a.shortc-button[href]')
+    # Filter cdn_links to exclude cloud links (already captured) and non-download links
+    cdn_links = [a for a in cdn_links 
+                 if a.get('href') and not a['href'].startswith('//cloud.animetoki.com/')]
+    
+    all_links = list(cloud_links) + list(cdn_links)
+    
+    if not all_links:
         print("No streaming links found for this anime.")
         return None
-        
-    len_links = len(links_content)
-    links = [None] * len_links
 
-    for i, link in enumerate(links_content):
-        link_name = link.get_text()
-        links[i] = urljoin(base_url, link['href'])
-        print(f"{i+1}. {link_name}")
+    link_data = []  # list of (label, full_url, link_type)
+    for link in all_links:
+        label = link.get_text(strip=True)
+        href = urljoin(base_url, link['href'])
+        link_type = classify_link(href)
+        link_data.append((label, href, link_type))
+
+    for i, (label, href, link_type) in enumerate(link_data):
+        tag = ""
+        if link_type == 'direct_video':
+            tag = " [▶ ]"
+        elif link_type == 'worker_folder':
+            tag = " [🗁 ]"
+        print(f"{i+1}. {label}{tag}")
 
     print("0. Back")
-    selected_index = safe_input("> ", len_links)
+    selected_index = safe_input("> ", len(link_data))
     if selected_index == 0:
         return None
-    selected_link = links[selected_index-1]
-    path_segments = split_url(selected_link)
-    initial_link_base64 = url_2_base64(path_segments, base_cloud_url)
-    return initial_link_base64
+    
+    label, selected_url, link_type = link_data[selected_index - 1]
+    
+    if link_type == 'cloud':
+        path_segments = split_url(selected_url)
+        initial_link_base64 = url_2_base64(path_segments, base_cloud_url)
+        return {"type": "cloud", "url": initial_link_base64}
+    elif link_type == 'direct_video':
+        # Collect all direct video links for episode navigation
+        direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
+        selected_ep_idx = next(i for i, (l, u) in enumerate(direct_episodes) if u == selected_url)
+        return {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx}
+    elif link_type == 'worker_folder':
+        return {"type": "worker_folder", "url": selected_url}
+    else:
+        # Unknown type, try opening as direct URL
+        return {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0}
 
 def fetch_content(url):    
     post_response = safe_request('post', url)
@@ -251,6 +361,118 @@ def fetch_content(url):
         
     return mimetype, file_id, file_name, initial_node_index, initial_file_list
 
+def fetch_worker_folder(url):
+    """Fetch a workers.dev folder and return list of (name, url, type) entries."""
+    res = safe_request('get', url)
+    if not res:
+        return None
+    soup = BeautifulSoup(res.content, 'html.parser')
+    
+    folder_parsed = urlparse(url)
+    folder_domain = folder_parsed.netloc
+    folder_path = folder_parsed.path
+    
+    entries = []
+    for a in soup.select('a[href]'):
+        href = a.get('href', '')
+        if not href or href in ('.', '..', '../'):
+            continue
+        full_url = urljoin(url, href)
+        link_parsed = urlparse(full_url)
+        # Only include links on the same domain and under the same base path
+        if link_parsed.netloc != folder_domain:
+            continue
+        if not link_parsed.path.startswith(folder_path.split('/0:/')[0]):
+            continue
+        label = a.get_text(strip=True) or unquote(link_parsed.path.split('/')[-1] or link_parsed.path.split('/')[-2])
+        link_type = classify_link(full_url)
+        entries.append((label, full_url, link_type))
+    
+    if not entries:
+        print("No files found in this folder.")
+        return None
+    
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+    entries.sort(key=lambda e: natural_sort_key(e[0]))
+    return entries
+
+def browse_worker_folder(url, download_mode=False):
+    """Browse a workers.dev folder, allowing navigation and playback."""
+    folder_stack = []
+    current_url = url
+    
+    while True:
+        entries = fetch_worker_folder(current_url)
+        if not entries:
+            if folder_stack:
+                current_url = folder_stack.pop()
+                continue
+            return
+        
+        for i, (label, href, link_type) in enumerate(entries):
+            tag = " [▶ ]" if link_type == 'direct_video' else " [🗁 ]" if link_type == 'worker_folder' else ""
+            print(f"{i+1}. {label}{tag}")
+        
+        print("0. Back")
+        user_input = safe_input("> ", len(entries))
+        if user_input == 0:
+            if folder_stack:
+                current_url = folder_stack.pop()
+                continue
+            return
+        
+        label, selected_url, link_type = entries[user_input - 1]
+        
+        if link_type == 'direct_video':
+            stream_url = resolve_stream_url(selected_url)
+            if download_mode:
+                filename = unquote(urlparse(selected_url).path.split('/')[-1])
+                download_file(stream_url, filename)
+            else:
+                stream_in_mpv(stream_url, title=label)
+        elif link_type == 'worker_folder':
+            folder_stack.append(current_url)
+            current_url = selected_url
+        else:
+            stream_url = resolve_stream_url(selected_url)
+            if download_mode:
+                filename = unquote(urlparse(selected_url).path.split('/')[-1])
+                download_file(stream_url, filename)
+            else:
+                stream_in_mpv(stream_url, title=label)
+
+def play_direct_episodes(episodes, selected_idx, download_mode=False):
+    """Play from a list of direct video episode links."""
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+    episodes.sort(key=lambda e: natural_sort_key(e[0]))
+    
+    # Play the initially selected episode
+    label, url = episodes[selected_idx]
+    stream_url = resolve_stream_url(url)
+    if download_mode:
+        filename = unquote(urlparse(url).path.split('/')[-1])
+        download_file(stream_url, filename)
+    else:
+        stream_in_mpv(stream_url, title=label)
+    
+    # Show list for further selection
+    while True:
+        for i, (label, url) in enumerate(episodes):
+            print(f"{i+1}. {label}")
+        print("0. Back")
+        user_input = safe_input("> ", len(episodes))
+        if user_input == 0:
+            return
+        label, url = episodes[user_input - 1]
+        stream_url = resolve_stream_url(url)
+        if download_mode:
+            filename = unquote(urlparse(url).path.split('/')[-1])
+            download_file(stream_url, filename)
+        else:
+            stream_in_mpv(stream_url, title=label)
+
 def select_content(folder_index, mimetype, file_id, file_name):
     initial_mimetype = mimetype[folder_index-1] 
     initial_file_id = file_id[folder_index-1]
@@ -273,7 +495,7 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
             if download_mode:
                 download_file(download_url, selected_file_name)
             else:
-                stream_in_mpv(download_url)
+                stream_in_mpv(download_url, title=selected_file_name)
             
             mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
         else:
@@ -314,20 +536,26 @@ def search(query, download_mode=False):
     if not selected_anime_url:
         return
         
-    initial_link_base64 = anime_download_link(selected_anime_url)
-    if not initial_link_base64:
+    result = anime_download_link(selected_anime_url)
+    if not result:
         return
-        
-    mimetype, file_id, file_name, initial_node_index, initial_file_list = fetch_content(initial_link_base64)
-    if not mimetype:
-        return
-        
-    print("0. Back")
-    folder_index = safe_input("> ", len(mimetype))
-    if folder_index == 0:
-        return
-    initial_mimetype, initial_file_id, initial_file_name = select_content(folder_index, mimetype, file_id, file_name)
-    play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, initial_link_base64, download_mode)
+    
+    if result["type"] == "cloud":
+        mimetype, file_id, file_name, initial_node_index, initial_file_list = fetch_content(result["url"])
+        if not mimetype:
+            return
+        print("0. Back")
+        folder_index = safe_input("> ", len(mimetype))
+        if folder_index == 0:
+            return
+        initial_mimetype, initial_file_id, initial_file_name = select_content(folder_index, mimetype, file_id, file_name)
+        play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, result["url"], download_mode)
+    
+    elif result["type"] == "direct_episodes":
+        play_direct_episodes(result["episodes"], result["selected"], download_mode)
+    
+    elif result["type"] == "worker_folder":
+        browse_worker_folder(result["url"], download_mode)
 
 def signal_handler(sig, frame):
     print("\nExiting...")
@@ -339,7 +567,16 @@ def main():
     parser = argparse.ArgumentParser(description="CLI anime player for animetoki.com")
     parser.add_argument("query", nargs="*", help="Search query (if provided, runs in non-interactive mode)")
     parser.add_argument("-d", "--download", action="store_true", help="Download the video instead of playing it")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     args = parser.parse_args()
+
+    if args.verbose:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        logger.addHandler(console_handler)
+
+    logger.info("=== anitokipy session started ===")
 
     check_deps(args.download)
     init_session()
@@ -350,7 +587,7 @@ def main():
         try:
             if initial_query:
                 query = initial_query
-                initial_query = None  # Clear it so we prompt next time
+                initial_query = None
             else:
                 query = input(">").strip()
                 if query.lower() == "exit":

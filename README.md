@@ -1,14 +1,6 @@
-# AitokiPy
+# AnitokiPy
 
-### Running [anitoki](https://animetoki.com/) in a cli interface
-
----
-
-> [!WARNING]
-> Breaks! no precautionary error fallbacks are implementead ...
-
-> [!IMPORTANT]
-> Only works on completed animes on anitoki.
+### Running [animetoki.com](https://animetoki.com/) in a cli interface
 
 ---
 ### setup
