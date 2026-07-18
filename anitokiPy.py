@@ -421,16 +421,23 @@ def browse_worker_folder(url, download_mode=False):
         label, selected_url, link_type = entries[idx]
         
         if link_type in ('direct_video', 'unknown'):
-            stream_url = resolve_stream_url(selected_url)
-            if download_mode:
-                download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
-            else:
+            # collect sibling videos for next/prev navigation
+            video_entries = [(i, l, u) for i, (l, u, t) in enumerate(entries) if t in ('direct_video', 'unknown')]
+            vid_idx = next((j for j, (i, l, u) in enumerate(video_entries) if i == idx), 0)
+            
+            while True:
+                _, label, selected_url = video_entries[vid_idx]
+                stream_url = resolve_stream_url(selected_url)
+                if download_mode:
+                    download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
+                    return
                 stream_in_mpv(stream_url, title=label)
-                while True:
-                    act = fzf_select(["replay", "select", "quit"], f"Playing {label}... ")
-                    if act == 0: stream_in_mpv(stream_url, title=label)
-                    elif act == 1: break
-                    else: return
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ")
+                if act == 0: vid_idx = min(vid_idx + 1, len(video_entries) - 1)
+                elif act == 1: pass
+                elif act == 2: vid_idx = max(vid_idx - 1, 0)
+                elif act == 3: break
+                else: return
         elif link_type == 'worker_folder':
             folder_stack.append(current_url)
             current_url = selected_url
@@ -476,9 +483,12 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
     selected_file_id = initial_file_id
     
     folder_stack = []
+    # pre-fetch so file_name/file_id/mimetype are bound for sibling navigation
+    mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
     
     while True:
         if "video" in selected_mimetype: 
+
             file_name_base64 = encode_2_base64(selected_file_name)
             download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
             if download_mode:
@@ -486,10 +496,30 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                 return
             stream_in_mpv(download_url, title=selected_file_name)
             
+            # build sibling video list for next/prev
+            if mimetype:
+                video_siblings = [(i, fn, fi) for i, (fn, fi, mt) in enumerate(zip(file_name, file_id, mimetype)) if mt and "video" in mt]
+            else:
+                video_siblings = []
+            vid_idx = next((j for j, (i, fn, fi) in enumerate(video_siblings) if fn == selected_file_name), 0)
+            
             while True:
-                act = fzf_select(["replay", "select", "quit"], f"Playing {selected_file_name}... ")
-                if act == 0: stream_in_mpv(download_url, title=selected_file_name)
-                elif act == 1: break
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {selected_file_name}... ")
+                if act == 0:
+                    vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
+                    _, selected_file_name, selected_file_id = video_siblings[vid_idx]
+                    file_name_base64 = encode_2_base64(selected_file_name)
+                    download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
+                    stream_in_mpv(download_url, title=selected_file_name)
+                elif act == 1:
+                    stream_in_mpv(download_url, title=selected_file_name)
+                elif act == 2:
+                    vid_idx = max(vid_idx - 1, 0)
+                    _, selected_file_name, selected_file_id = video_siblings[vid_idx]
+                    file_name_base64 = encode_2_base64(selected_file_name)
+                    download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
+                    stream_in_mpv(download_url, title=selected_file_name)
+                elif act == 3: break
                 else: return
             mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
         else:
