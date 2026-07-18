@@ -1,4 +1,3 @@
-import curl_cffi
 import json
 import base64
 import subprocess
@@ -11,7 +10,7 @@ import re
 import os
 import logging
 from pathlib import Path
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests as cffi_requests
 
@@ -32,6 +31,13 @@ search_url = "https://animetoki.com/?s="
 base_cloud_url = "https://cloud.animetoki.com/"
 session = None
 hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+
+def _cookie_header():
+    return "; ".join(f"{name}={value}" for name, value in session.cookies.items())
+
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 def update_history(title, url):
     hist_file.parent.mkdir(parents=True, exist_ok=True)
@@ -105,17 +111,12 @@ def safe_input(prompt, max_val=None, allow_zero_back=True):
             sys.exit(0)
 
 def stream_in_mpv(download_url, title=None):
-    global session
-    cookie_strings = [f"{name}={value}" for name, value in session.cookies.items()]
-    cookie_header = "; ".join(cookie_strings)
-    firefox_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
-
     if is_termux():
         mpv_conf_path = "/storage/emulated/0/mpv/mpv.config.mp4"
         try:
             with open(mpv_conf_path, 'w') as f:
-                f.write(f'user-agent={firefox_ua}\n')
-                f.write(f'http-header-fields=Cookie: {cookie_header}\n')
+                f.write(f'user-agent={UA}\n')
+                f.write(f'http-header-fields=Cookie: {_cookie_header()}\n')
                 f.write('cache=yes\n')
                 f.write('demuxer-max-bytes=200MiB\n')
         except OSError as e:
@@ -139,8 +140,8 @@ def stream_in_mpv(download_url, title=None):
     else:
         mpv_flags = [
             'mpv',
-            f'--user-agent={firefox_ua}',
-            f'--http-header-fields=Cookie: {cookie_header}',
+            f'--user-agent={UA}',
+            f'--http-header-fields=Cookie: {_cookie_header()}',
             '--cache=yes',
             '--demuxer-max-bytes=200MiB',
             download_url,
@@ -154,15 +155,10 @@ def stream_in_mpv(download_url, title=None):
 
 def download_file(url, output_name):
     print(f"Downloading to {output_name}...")
-    global session
-    cookie_strings = [f"{name}={value}" for name, value in session.cookies.items()]
-    cookie_header = "; ".join(cookie_strings)
-    firefox_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
-    
     curl_flags = [
         'curl', '-L',
-        '-A', firefox_ua,
-        '-H', f'Cookie: {cookie_header}',
+        '-A', UA,
+        '-H', f'Cookie: {_cookie_header()}',
         '-o', output_name,
         url
     ]
@@ -171,26 +167,7 @@ def download_file(url, output_name):
     except FileNotFoundError:
         print("curl is not installed. Cannot download.")
 
-def encode_2_base64(s):
-    decoded_url = unquote(s)
-    base = decoded_url.encode()
-    base = base64.b64encode(base)
-    encoded2_64 = base.decode('utf-8')
-    return encoded2_64
-
-def split_url(url):
-    parse_object = urlparse(url)
-    path_segments = [s for s in parse_object.path.split('/') if s]
-    return path_segments
-
-def url_2_base64(path_segments, base_cloud_url):
-    for i in range(len(path_segments)):
-        path_segments[i] = encode_2_base64(path_segments[i])
-    url_base64 = base_cloud_url + "/".join(path_segments) + "/"
-    return url_base64
-
 def fetch_anime_list(anime_search_url):
-    global base_url
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
         return None
@@ -235,11 +212,9 @@ def resolve_stream_url(url):
     parsed = urlparse(url)
     if 'workers.dev' not in parsed.netloc:
         if parsed.query:
-            from urllib.parse import parse_qs, urlencode
             params = parse_qs(parsed.query)
             params.pop('a', None)
-            new_query = urlencode(params, doseq=True)
-            return parsed._replace(query=new_query).geturl()
+            return parsed._replace(query=urlencode(params, doseq=True)).geturl()
         return url
 
     # For workers.dev links, we must query the parent folder's API
@@ -262,7 +237,7 @@ def resolve_stream_url(url):
         for f in data.get('files', []):
             if f.get('name') == file_name:
                 file_id = f.get('id')
-                encoded_name = encode_2_base64(file_name)
+                encoded_name = base64.b64encode(unquote(file_name).encode()).decode()
                 stream_url = f"{parsed.scheme}://{parsed.netloc}/?a=download&id={file_id}&name={encoded_name}"
                 logger.debug(f"resolve_stream_url: resolved to {stream_url}")
                 return stream_url
@@ -272,7 +247,6 @@ def resolve_stream_url(url):
     return url
 
 def anime_download_link(selected_anime_url):
-    global base_url
     res_anime = safe_request('get', selected_anime_url)
     if not res_anime:
         return None
@@ -311,9 +285,8 @@ def anime_download_link(selected_anime_url):
     label, selected_url, link_type = link_data[idx]
     
     if link_type == 'cloud':
-        path_segments = split_url(selected_url)
-        initial_link_base64 = url_2_base64(path_segments, base_cloud_url)
-        return {"type": "cloud", "url": initial_link_base64}
+        segments = [base64.b64encode(unquote(s).encode()).decode() for s in urlparse(selected_url).path.split('/') if s]
+        return {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/"}
     elif link_type == 'direct_video':
         # Collect all direct video links for episode navigation
         direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
@@ -343,20 +316,11 @@ def fetch_content(url):
         
     initial_node_index = str(dict_json_.get("node_index", ""))
 
-    def natural_sort_key(s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
-
     initial_file_list.sort(key=lambda item: natural_sort_key(item.get("name", "")))
-
-    len_initial_file_list = len(initial_file_list)
-    mimetype = [None] * len_initial_file_list
-    file_id = [None] * len_initial_file_list
-    file_name = [None] * len_initial_file_list
     
-    for i, item in enumerate(initial_file_list):
-        mimetype[i] = item.get("mimeType")
-        file_name[i] = item.get("name")
-        file_id[i] = item.get("id")
+    mimetype = [x.get("mimeType") for x in initial_file_list]
+    file_name = [x.get("name") for x in initial_file_list]
+    file_id = [x.get("id") for x in initial_file_list]
         
     return mimetype, file_id, file_name, initial_node_index, initial_file_list
 
@@ -391,8 +355,6 @@ def fetch_worker_folder(url):
         print("No files found in this folder.")
         return None
     
-    def natural_sort_key(s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
     entries.sort(key=lambda e: natural_sort_key(e[0]))
     return entries
 
@@ -445,8 +407,6 @@ def browse_worker_folder(url, download_mode=False):
 
 def play_direct_episodes(episodes, selected_idx, download_mode=False):
     """Play from a list of direct video episode links."""
-    def natural_sort_key(s):
-        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
     episodes.sort(key=lambda e: natural_sort_key(e[0]))
     
     idx = selected_idx
@@ -469,13 +429,10 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False):
             idx = res
         else: return
 
-def select_content(folder_index, mimetype, file_id, file_name):
-    initial_mimetype = mimetype[folder_index-1] 
-    initial_file_id = file_id[folder_index-1]
-    initial_file_name = file_name[folder_index-1]
-    return initial_mimetype, initial_file_id, initial_file_name
-
 def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, initial_link_base64, download_mode=False):    
+    def _cloud_dl_url(fid, fname, nidx):
+        return f"{base_cloud_url}?a=download&id={fid}&name={base64.b64encode(unquote(fname).encode()).decode()}&n={nidx}"
+
     current_folder_url = initial_link_base64
     selected_mimetype = initial_mimetype
     selected_file_name = initial_file_name
@@ -488,9 +445,7 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
     
     while True:
         if "video" in selected_mimetype: 
-
-            file_name_base64 = encode_2_base64(selected_file_name)
-            download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
+            download_url = _cloud_dl_url(selected_file_id, selected_file_name, file_node_index)
             if download_mode:
                 download_file(download_url, selected_file_name)
                 return
@@ -508,24 +463,19 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                 if act == 0:
                     vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
                     _, selected_file_name, selected_file_id = video_siblings[vid_idx]
-                    file_name_base64 = encode_2_base64(selected_file_name)
-                    download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
-                    stream_in_mpv(download_url, title=selected_file_name)
+                    stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 1:
-                    stream_in_mpv(download_url, title=selected_file_name)
+                    stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 2:
                     vid_idx = max(vid_idx - 1, 0)
                     _, selected_file_name, selected_file_id = video_siblings[vid_idx]
-                    file_name_base64 = encode_2_base64(selected_file_name)
-                    download_url = base_cloud_url + "?a=download&id=" + selected_file_id + "&name=" + file_name_base64 + "&n=" + file_node_index
-                    stream_in_mpv(download_url, title=selected_file_name)
+                    stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 3: break
                 else: return
             mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
         else:
-            folder_name_base64 = encode_2_base64(selected_file_name)
             folder_stack.append(current_folder_url)
-            current_folder_url = current_folder_url + folder_name_base64 + "/"
+            current_folder_url += base64.b64encode(unquote(selected_file_name).encode()).decode() + "/"
             mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
 
         while True:
@@ -544,7 +494,7 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                     continue
                 return
                 
-            selected_mimetype, selected_file_id, selected_file_name = select_content(idx + 1, mimetype, file_id, file_name)
+            selected_mimetype, selected_file_id, selected_file_name = mimetype[idx], file_id[idx], file_name[idx]
             break
 
 def search(query, download_mode=False):
@@ -563,8 +513,7 @@ def search(query, download_mode=False):
             return
         idx = fzf_select(file_name, "Select file: ")
         if idx is None: return
-        initial_mimetype, initial_file_id, initial_file_name = select_content(idx + 1, mimetype, file_id, file_name)
-        play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, result["url"], download_mode)
+        play_and_browse(mimetype[idx], file_name[idx], initial_node_index, file_id[idx], initial_file_list, result["url"], download_mode)
     
     elif result["type"] == "direct_episodes":
         play_direct_episodes(result["episodes"], result["selected"], download_mode)
@@ -601,7 +550,7 @@ def main():
 
     while True:
         try:
-            if getattr(args, 'continue_watch', False):
+            if args.continue_watch:
                 try:
                     with open(hist_file, "r") as f: hist = json.load(f)
                     titles = list(hist.keys())
@@ -617,8 +566,7 @@ def main():
                             if mimetype:
                                 f_idx = fzf_select(file_name, "Select file: ")
                                 if f_idx is not None:
-                                    imime, ifid, iname = select_content(f_idx + 1, mimetype, file_id, file_name)
-                                    play_and_browse(imime, iname, initial_node_index, ifid, initial_file_list, result["url"], args.download)
+                                    play_and_browse(mimetype[f_idx], file_name[f_idx], initial_node_index, file_id[f_idx], initial_file_list, result["url"], args.download)
                 except Exception as e: print("No history found.")
                 args.continue_watch = False
                 continue
