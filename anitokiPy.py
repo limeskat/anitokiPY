@@ -533,6 +533,7 @@ def main():
     parser.add_argument("-d", "--download", action="store_true", help="Download the video instead of playing it")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
+    parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history")
     args = parser.parse_args()
 
     if args.verbose:
@@ -547,6 +548,14 @@ def main():
     init_session()
 
     initial_query = " ".join(args.query) if args.query else None
+
+    if getattr(args, 'clear_history', False):
+        try:
+            hist_file.unlink(missing_ok=True)
+        except TypeError: # Python < 3.8 compat
+            if hist_file.exists(): hist_file.unlink()
+        print("History cleared.")
+        return
 
     while True:
         try:
