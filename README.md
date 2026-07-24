@@ -58,6 +58,9 @@ You can customize `anitokipy` by creating a JSON configuration file at `~/.confi
 
 ### Features & Navigation
 - **Loading Spinner**: Interactive terminal spinner provides visual feedback during network requests.
-- **Fuzzy Search & Menu Navigation**: Use `fzf` to search through anime, episodes, or watch history. If stdin/stdout is not a TTY or `fzf` is unavailable, numbered menus are used.
+- **Fuzzy Search & Arrow Key Navigation**: Use `fzf` to search through anime, episodes, folders, or watch history:
+  - **`[← Left]`**: Go back to parent folder or previous menu.
+  - **`[→ Right / Enter]`**: Select item or open subfolder.
+  Keybindings are prominently displayed in the menu footer at the bottom of the terminal.
 - **Post-Play Controls**: After an episode finishes (or `mpv` is closed), options appear to play `next`, `replay`, `previous`, `select` a file, or `quit`.
 - **Exit**: Type `exit` in the search prompt or press `Ctrl+D` / `Ctrl+C` to cleanly exit.

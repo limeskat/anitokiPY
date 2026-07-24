@@ -203,21 +203,39 @@ def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
 def fzf_select(items, prompt, default_idx=None):
     if not items:
         return None
+    footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-        cmd = ["fzf", "--reverse", "--cycle", "--prompt", prompt, "--with-nth=2", "--delimiter=\t"]
+        cmd = [
+            "fzf",
+            "--reverse",
+            "--cycle",
+            "--prompt", prompt,
+            "--with-nth=2",
+            "--delimiter=\t",
+            "--expect=left,right",
+            f"--footer={footer_text}\n "
+        ]
         if default_idx is not None and 0 <= default_idx < len(items):
             cmd.append(f"--bind=start:pos({default_idx + 1})")
             
         text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
         p = subprocess.run(cmd, input=text, text=True, capture_output=True)
-        if p.returncode == 0 and p.stdout.strip():
-            try:
-                return int(p.stdout.split('\t')[0])
-            except (ValueError, IndexError):
-                pass
+        if p.returncode == 0 and p.stdout:
+            lines = p.stdout.splitlines()
+            if lines:
+                key_pressed = lines[0].strip().lower()
+                if key_pressed == "left":
+                    return None
+                if len(lines) > 1 and lines[1].strip():
+                    try:
+                        return int(lines[1].split('\t')[0])
+                    except (ValueError, IndexError):
+                        pass
+        return None
     
     for i, item in enumerate(items): print(f"{i+1}. {item}")
     print("0. Back")
+    print(f"\033[90m{footer_text}\033[0m")
     p_str = f"\033[1;36m{prompt}\033[0m"
     if default_idx is not None and 0 <= default_idx < len(items):
         p_str += f" [{default_idx + 1}]: "
