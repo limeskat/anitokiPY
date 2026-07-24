@@ -3,10 +3,12 @@
 ### Running [animetoki.com](https://animetoki.com/) in a cli interface.
 
 ---
+
 ### Dependencies
 
-- **`mpv`**: Required for streaming video.
-- **`fzf`**: Recommended for ani-cli like ui/navigation (falls back to numbered lists if not installed).
+- **`mpv`**: Required for streaming video (automatically saves and resumes play position).
+- **`fzf`**: Recommended for interactive fuzzy selection (gracefully falls back to numbered menus in non-interactive/piped sessions or if `fzf` is uninstalled).
+- **`curl`**: Used for downloading videos with progress output.
 
 ### Setup
 
@@ -27,12 +29,35 @@ anitokipy "anime name"
 
 ### Flags
 
-- `-c, --continue-watch`: Open your watch history and jump straight back into the last anime you viewed.
+- `-c, --continue-watch`: Open your watch history and jump straight back into the last anime you viewed (exits with a clean message if history is empty).
 - `-C, --clear-history`: Delete your watch history file.
-- `-d, --download`: Download the video file to the current directory instead of streaming it.
+- `-d, --download`: Download the video file (to `download_dir` or current directory) with a progress bar instead of streaming.
 - `-v, --verbose`: Show debug log output in the terminal.
 
-### Navigation
-- Inside menus, use `fzf` to type and fuzzy-search through anime, episodes, or history.
-- After an episode finishes (or you close `mpv`), a post-play menu appears letting you play the `next` episode, `replay`, go to the `previous` episode, `select` a different file, or `quit`.
-- Type `exit` in the main search prompt to exit the script.
+### Configuration
+
+You can customize `anitokipy` by creating a JSON configuration file at `~/.config/anitokipy/config.json`:
+
+```json
+{
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+  "mpv_flags": [
+    "--cache=yes",
+    "--demuxer-max-bytes=200MiB",
+    "--save-position-on-quit",
+    "--fullscreen"
+  ],
+  "download_dir": "."
+}
+```
+
+#### Config Keys:
+- **`user_agent`**: Custom HTTP User-Agent string for network requests and streaming.
+- **`mpv_flags`**: List of command-line flags passed to `mpv` when streaming (`--save-position-on-quit` is enabled by default to preserve playback timestamps).
+- **`download_dir`**: Directory where downloaded files are saved when using `-d` / `--download`.
+
+### Features & Navigation
+- **Loading Spinner**: Interactive terminal spinner provides visual feedback during network requests.
+- **Fuzzy Search & Menu Navigation**: Use `fzf` to search through anime, episodes, or watch history. If stdin/stdout is not a TTY or `fzf` is unavailable, numbered menus are used.
+- **Post-Play Controls**: After an episode finishes (or `mpv` is closed), options appear to play `next`, `replay`, `previous`, `select` a file, or `quit`.
+- **Exit**: Type `exit` in the search prompt or press `Ctrl+D` / `Ctrl+C` to cleanly exit.
