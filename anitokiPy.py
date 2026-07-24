@@ -39,24 +39,121 @@ def _cookie_header():
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
-def update_history(title, url):
+class HistoryContext:
+    def __init__(self, title, anime_url, source_label="", source_type="", source_url=""):
+        self.title = title
+        self.anime_url = anime_url
+        self.source_label = source_label
+        self.source_type = source_type
+        self.source_url = source_url
+
+def save_history_entry(title, payload):
     hist_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(hist_file, "r") as f: hist = json.load(f)
-    except: hist = {}
-    hist[title] = url
-    with open(hist_file, "w") as f: json.dump(hist, f)
+        if hist_file.exists():
+            with open(hist_file, "r") as f: hist = json.load(f)
+        else: hist = {}
+    except Exception as e:
+        logger.debug(f"Error reading history file: {e}")
+        hist = {}
+    if not isinstance(hist, dict): hist = {}
+    hist[title] = payload
+    tmp_file = hist_file.with_suffix(".tmp")
+    try:
+        with open(tmp_file, "w") as f: json.dump(hist, f, indent=2)
+        tmp_file.replace(hist_file)
+        logger.debug(f"Saved history entry for '{title}'")
+    except Exception as e:
+        logger.error(f"Failed to save history: {e}")
 
-def fzf_select(items, prompt):
+def _migrate_history_entry(data):
+    if isinstance(data, str):
+        return {
+            "anime_url": data,
+            "version": 1
+        }
+    return data
+
+def load_history():
+    if not hist_file.exists():
+        return {}
+    try:
+        with open(hist_file, "r") as f: hist = json.load(f)
+        if isinstance(hist, dict):
+            return {k: _migrate_history_entry(v) for k, v in hist.items()}
+    except Exception as e:
+        logger.debug(f"Failed to load history: {e}")
+    return {}
+
+def update_history(title, url):
+    payload = {
+        "anime_url": url,
+        "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": 1
+    }
+    save_history_entry(title, payload)
+
+def save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id=None, selected_mimetype=None):
+    payload = {
+        "anime_url": hist_ctx.anime_url,
+        "source_label": hist_ctx.source_label,
+        "source_type": "cloud",
+        "source_url": hist_ctx.source_url,
+        "folder_stack": list(folder_stack),
+        "current_folder_url": current_folder_url,
+        "selected_file_name": selected_file_name,
+        "selected_file_id": selected_file_id,
+        "selected_mimetype": selected_mimetype,
+        "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": 1
+    }
+    save_history_entry(hist_ctx.title, payload)
+
+def save_direct_history(hist_ctx, episodes, selected_idx):
+    payload = {
+        "anime_url": hist_ctx.anime_url,
+        "source_label": hist_ctx.source_label,
+        "source_type": "direct_episodes",
+        "source_url": hist_ctx.source_url,
+        "episodes": episodes,
+        "selected_idx": selected_idx,
+        "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": 1
+    }
+    save_history_entry(hist_ctx.title, payload)
+
+def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
+    payload = {
+        "anime_url": hist_ctx.anime_url,
+        "source_label": hist_ctx.source_label,
+        "source_type": "worker_folder",
+        "source_url": hist_ctx.source_url,
+        "folder_stack": list(folder_stack),
+        "current_folder_url": current_url,
+        "selected_file_name": selected_name,
+        "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": 1
+    }
+    save_history_entry(hist_ctx.title, payload)
+
+def fzf_select(items, prompt, default_idx=None):
+    if not items:
+        return None
     if not shutil.which("fzf"):
         for i, item in enumerate(items): print(f"{i+1}. {item}")
         print("0. Back")
-        idx = safe_input(f"\033[1;36m{prompt}\033[0m", len(items))
+        p_str = f"\033[1;36m{prompt}\033[0m"
+        if default_idx is not None and 0 <= default_idx < len(items):
+            p_str += f" [{default_idx + 1}]: "
+        idx = safe_input(p_str, len(items), default_val=default_idx + 1 if default_idx is not None else None)
         return idx - 1 if idx > 0 else None
     
+    cmd = ["fzf", "--reverse", "--cycle", "--prompt", prompt, "--with-nth=2", "--delimiter=\t"]
+    if default_idx is not None and 0 <= default_idx < len(items):
+        cmd.append(f"--bind=start:pos({default_idx + 1})")
+        
     text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
-    p = subprocess.run(["fzf", "--reverse", "--cycle", "--prompt", prompt, "--with-nth=2", "--delimiter=\t"], 
-                       input=text, text=True, capture_output=True)
+    p = subprocess.run(cmd, input=text, text=True, capture_output=True)
     return int(p.stdout.split('\t')[0]) if p.returncode == 0 else None
 
 def init_session():
@@ -90,11 +187,13 @@ def safe_request(method, url, max_retries=3, timeout=3, **kwargs):
             time.sleep(1)
     return None
 
-def safe_input(prompt, max_val=None, allow_zero_back=True):
+def safe_input(prompt, max_val=None, allow_zero_back=True, default_val=None):
     while True:
         try:
             val = input(prompt).strip()
             if not val:
+                if default_val is not None:
+                    return default_val
                 continue
             ival = int(val)
             if allow_zero_back and ival == 0:
@@ -283,20 +382,28 @@ def anime_download_link(selected_anime_url):
     if idx is None: return None
     
     label, selected_url, link_type = link_data[idx]
+    stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
+    hist_ctx = HistoryContext(
+        title=title_text,
+        anime_url=selected_anime_url,
+        source_label=label,
+        source_type=stype,
+        source_url=selected_url
+    )
     
     if link_type == 'cloud':
         segments = [base64.b64encode(unquote(s).encode()).decode() for s in urlparse(selected_url).path.split('/') if s]
-        return {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/"}
+        return {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
     elif link_type == 'direct_video':
         # Collect all direct video links for episode navigation
         direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
         selected_ep_idx = next(i for i, (l, u) in enumerate(direct_episodes) if u == selected_url)
-        return {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx}
+        return {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx, "hist_ctx": hist_ctx}
     elif link_type == 'worker_folder':
-        return {"type": "worker_folder", "url": selected_url}
+        return {"type": "worker_folder", "url": selected_url, "hist_ctx": hist_ctx}
     else:
         # Unknown type, try opening as direct URL
-        return {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0}
+        return {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
 
 def fetch_content(url):    
     post_response = safe_request('post', url)
@@ -358,29 +465,44 @@ def fetch_worker_folder(url):
     entries.sort(key=lambda e: natural_sort_key(e[0]))
     return entries
 
-def browse_worker_folder(url, download_mode=False):
+def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=None):
     """Browse a workers.dev folder, allowing navigation and playback."""
-    folder_stack = []
-    current_url = url
+    if resume_from:
+        folder_stack = list(resume_from.get("folder_stack", []))
+        current_url = resume_from.get("current_folder_url", url)
+        default_highlight = resume_from.get("selected_file_name")
+    else:
+        folder_stack = []
+        current_url = url
+        default_highlight = None
     
     while True:
         entries = fetch_worker_folder(current_url)
         if not entries:
-            if folder_stack:
+            while folder_stack and not entries:
                 current_url = folder_stack.pop()
-                continue
-            return
+                entries = fetch_worker_folder(current_url)
+            if not entries:
+                logger.debug("Worker folder unreachable and stack exhausted.")
+                return False
         
         labels = [f"{l} [{'▶' if t == 'direct_video' else '🗁' if t == 'worker_folder' else ' '}]" for l, _, t in entries]
-        idx = fzf_select(labels, "Select: ")
+        default_idx = None
+        if default_highlight:
+            default_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None)
+            default_highlight = None
+            
+        idx = fzf_select(labels, "Select: ", default_idx=default_idx)
         
         if idx is None:
             if folder_stack:
                 current_url = folder_stack.pop()
                 continue
-            return
+            return True
         
         label, selected_url, link_type = entries[idx]
+        if hist_ctx:
+            save_worker_history(hist_ctx, current_url, folder_stack, label)
         
         if link_type in ('direct_video', 'unknown'):
             # collect sibling videos for next/prev navigation
@@ -389,33 +511,48 @@ def browse_worker_folder(url, download_mode=False):
             
             while True:
                 _, label, selected_url = video_entries[vid_idx]
+                if hist_ctx:
+                    save_worker_history(hist_ctx, current_url, folder_stack, label)
                 stream_url = resolve_stream_url(selected_url)
                 if download_mode:
                     download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
-                    return
+                    return True
                 stream_in_mpv(stream_url, title=label)
                 act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ")
                 if act == 0: vid_idx = min(vid_idx + 1, len(video_entries) - 1)
                 elif act == 1: pass
                 elif act == 2: vid_idx = max(vid_idx - 1, 0)
                 elif act == 3: break
-                else: return
+                else: return True
         elif link_type == 'worker_folder':
             folder_stack.append(current_url)
             current_url = selected_url
+    return True
 
 
-def play_direct_episodes(episodes, selected_idx, download_mode=False):
+def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=None, resume=False):
     """Play from a list of direct video episode links."""
     episodes.sort(key=lambda e: natural_sort_key(e[0]))
     
     idx = selected_idx
+    if idx < 0 or idx >= len(episodes):
+        idx = 0
+
+    if resume:
+        res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx)
+        if res is None:
+            return True
+        idx = res
+
     while True:
         label, url = episodes[idx]
+        if hist_ctx:
+            save_direct_history(hist_ctx, episodes, idx)
+            
         stream_url = resolve_stream_url(url)
         if download_mode:
             download_file(stream_url, unquote(urlparse(url).path.split('/')[-1]))
-            return
+            return True
             
         stream_in_mpv(stream_url, title=label)
         act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ")
@@ -424,31 +561,51 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False):
         elif act == 1: pass
         elif act == 2: idx = max(idx - 1, 0)
         elif act == 3:
-            res = fzf_select([e[0] for e in episodes], "Select episode: ")
-            if res is None: return
+            res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx)
+            if res is None: return True
             idx = res
-        else: return
+        else: return True
+    return True
 
-def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, initial_link_base64, download_mode=False):    
+def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, initial_file_id, initial_file_list, initial_link_base64, download_mode=False, hist_ctx=None, resume_from=None):    
     def _cloud_dl_url(fid, fname, nidx):
         return f"{base_cloud_url}?a=download&id={fid}&name={base64.b64encode(unquote(fname).encode()).decode()}&n={nidx}"
 
-    current_folder_url = initial_link_base64
-    selected_mimetype = initial_mimetype
-    selected_file_name = initial_file_name
-    file_node_index = initial_node_index
-    selected_file_id = initial_file_id
-    
-    folder_stack = []
-    # pre-fetch so file_name/file_id/mimetype are bound for sibling navigation
-    mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
-    
+    if resume_from:
+        current_folder_url = resume_from["current_folder_url"]
+        folder_stack = list(resume_from.get("folder_stack", []))
+        mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
+        while folder_stack and not mimetype:
+            current_folder_url = folder_stack.pop()
+            mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
+        if not mimetype:
+            logger.debug("Resume target cloud folder unreachable and stack exhausted.")
+            return False
+            
+        last_name = resume_from.get("selected_file_name")
+        default_idx = next((i for i, fn in enumerate(file_name) if fn == last_name), None) if (file_name and last_name) else None
+        idx = fzf_select(file_name, "Select file: ", default_idx=default_idx)
+        if idx is None:
+            return True
+        selected_mimetype, selected_file_id, selected_file_name = mimetype[idx], file_id[idx], file_name[idx]
+    else:
+        current_folder_url = initial_link_base64
+        selected_mimetype = initial_mimetype
+        selected_file_name = initial_file_name
+        file_node_index = initial_node_index
+        selected_file_id = initial_file_id
+        folder_stack = []
+        mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
+
+    if hist_ctx and selected_file_name:
+        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id, selected_mimetype)
+
     while True:
-        if "video" in selected_mimetype: 
+        if selected_mimetype and "video" in selected_mimetype: 
             download_url = _cloud_dl_url(selected_file_id, selected_file_name, file_node_index)
             if download_mode:
                 download_file(download_url, selected_file_name)
-                return
+                return True
             stream_in_mpv(download_url, title=selected_file_name)
             
             # build sibling video list for next/prev
@@ -463,15 +620,19 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                 if act == 0:
                     vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
                     _, selected_file_name, selected_file_id = video_siblings[vid_idx]
+                    if hist_ctx:
+                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id, selected_mimetype)
                     stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 1:
                     stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 2:
                     vid_idx = max(vid_idx - 1, 0)
                     _, selected_file_name, selected_file_id = video_siblings[vid_idx]
+                    if hist_ctx:
+                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id, selected_mimetype)
                     stream_in_mpv(_cloud_dl_url(selected_file_id, selected_file_name, file_node_index), title=selected_file_name)
                 elif act == 3: break
-                else: return
+                else: return True
             mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
         else:
             folder_stack.append(current_folder_url)
@@ -484,7 +645,7 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                     current_folder_url = folder_stack.pop()
                     mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
                     continue
-                return
+                return True
                 
             idx = fzf_select(file_name, "Select file: ")
             if idx is None:
@@ -492,10 +653,91 @@ def play_and_browse(initial_mimetype, initial_file_name, initial_node_index, ini
                     current_folder_url = folder_stack.pop()
                     mimetype, file_id, file_name, file_node_index, file_list = fetch_content(current_folder_url)
                     continue
-                return
+                return True
                 
             selected_mimetype, selected_file_id, selected_file_name = mimetype[idx], file_id[idx], file_name[idx]
+            if hist_ctx:
+                save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id, selected_mimetype)
             break
+    return True
+
+def _dispatch_result(result, download_mode):
+    if not result:
+        return
+    hist_ctx = result.get("hist_ctx")
+    if result["type"] == "cloud":
+        mimetype, file_id, file_name, initial_node_index, initial_file_list = fetch_content(result["url"])
+        if not mimetype:
+            return
+        idx = fzf_select(file_name, "Select file: ")
+        if idx is None: return
+        play_and_browse(mimetype[idx], file_name[idx], initial_node_index, file_id[idx], initial_file_list, result["url"], download_mode, hist_ctx=hist_ctx)
+    elif result["type"] == "direct_episodes":
+        play_direct_episodes(result["episodes"], result["selected"], download_mode, hist_ctx=hist_ctx)
+    elif result["type"] == "worker_folder":
+        browse_worker_folder(result["url"], download_mode, hist_ctx=hist_ctx)
+
+def resume_history(title, entry, download_mode=False):
+    logger.debug(f"Resuming history for '{title}': {entry}")
+    anime_url = entry.get("anime_url")
+    source_type = entry.get("source_type")
+    
+    if not source_type or not anime_url:
+        logger.debug(f"Legacy entry or missing source_type for '{title}'. Navigating from home URL.")
+        if anime_url:
+            res = anime_download_link(anime_url)
+            _dispatch_result(res, download_mode)
+        return
+
+    hist_ctx = HistoryContext(
+        title=title,
+        anime_url=anime_url,
+        source_label=entry.get("source_label", ""),
+        source_type=source_type,
+        source_url=entry.get("source_url", "")
+    )
+
+    if source_type == "cloud":
+        ok = play_and_browse(
+            initial_mimetype=None,
+            initial_file_name=None,
+            initial_node_index=None,
+            initial_file_id=None,
+            initial_file_list=None,
+            initial_link_base64=None,
+            download_mode=download_mode,
+            hist_ctx=hist_ctx,
+            resume_from=entry
+        )
+        if not ok:
+            print("Failed to reach saved cloud folder. Falling back to anime home page.")
+            res = anime_download_link(anime_url)
+            _dispatch_result(res, download_mode)
+
+    elif source_type == "direct_episodes":
+        episodes = entry.get("episodes", [])
+        selected_idx = entry.get("selected_idx", 0)
+        if not episodes:
+            print("No episodes recorded. Falling back to anime home page.")
+            res = anime_download_link(anime_url)
+            _dispatch_result(res, download_mode)
+        else:
+            play_direct_episodes(episodes, selected_idx, download_mode=download_mode, hist_ctx=hist_ctx, resume=True)
+
+    elif source_type == "worker_folder":
+        url = entry.get("current_folder_url") or entry.get("source_url")
+        if not url:
+            res = anime_download_link(anime_url)
+            _dispatch_result(res, download_mode)
+        else:
+            ok = browse_worker_folder(url, download_mode=download_mode, hist_ctx=hist_ctx, resume_from=entry)
+            if not ok:
+                print("Failed to reach saved worker folder. Falling back to anime home page.")
+                res = anime_download_link(anime_url)
+                _dispatch_result(res, download_mode)
+    else:
+        res = anime_download_link(anime_url)
+        _dispatch_result(res, download_mode)
 
 def search(query, download_mode=False):
     anime_search_url = search_url + query
@@ -504,22 +746,7 @@ def search(query, download_mode=False):
         return
         
     result = anime_download_link(selected_anime_url)
-    if not result:
-        return
-    
-    if result["type"] == "cloud":
-        mimetype, file_id, file_name, initial_node_index, initial_file_list = fetch_content(result["url"])
-        if not mimetype:
-            return
-        idx = fzf_select(file_name, "Select file: ")
-        if idx is None: return
-        play_and_browse(mimetype[idx], file_name[idx], initial_node_index, file_id[idx], initial_file_list, result["url"], download_mode)
-    
-    elif result["type"] == "direct_episodes":
-        play_direct_episodes(result["episodes"], result["selected"], download_mode)
-    
-    elif result["type"] == "worker_folder":
-        browse_worker_folder(result["url"], download_mode)
+    _dispatch_result(result, download_mode)
 
 def signal_handler(sig, frame):
     print("\nExiting...")
@@ -560,23 +787,16 @@ def main():
     while True:
         try:
             if args.continue_watch:
-                try:
-                    with open(hist_file, "r") as f: hist = json.load(f)
+                hist = load_history()
+                if not hist:
+                    print("No history found.")
+                else:
                     titles = list(hist.keys())
                     idx = fzf_select(titles, "Select history: ")
                     if idx is not None:
-                        result = anime_download_link(hist[titles[idx]])
-                        if result and result["type"] == "direct_episodes":
-                            play_direct_episodes(result["episodes"], result["selected"], args.download)
-                        elif result and result["type"] == "worker_folder":
-                            browse_worker_folder(result["url"], args.download)
-                        elif result and result["type"] == "cloud":
-                            mimetype, file_id, file_name, initial_node_index, initial_file_list = fetch_content(result["url"])
-                            if mimetype:
-                                f_idx = fzf_select(file_name, "Select file: ")
-                                if f_idx is not None:
-                                    play_and_browse(mimetype[f_idx], file_name[f_idx], initial_node_index, file_id[f_idx], initial_file_list, result["url"], args.download)
-                except Exception as e: print("No history found.")
+                        selected_title = titles[idx]
+                        entry = hist[selected_title]
+                        resume_history(selected_title, entry, args.download)
                 args.continue_watch = False
                 continue
 
