@@ -219,14 +219,44 @@ def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
     }
     save_history_entry(hist_ctx.title, payload)
 
+def format_item_label(name: str, item_type: str) -> str:
+    """Format label with type icon and ANSI colors: Skinish peach for folders, White for files/videos."""
+    if item_type in ('folder', 'worker_folder', 'cloud'):
+        return f"\033[1;38;5;215m🗁  {name}\033[0m"
+    elif item_type in ('video', 'direct_video', 'file'):
+        return f"\033[1;37m▶  {name}\033[0m"
+    else:
+        return f"\033[0m   {name}"
+
+def format_cloud_file_label(cf: CloudFile) -> str:
+    """Format CloudFile with type icon and ANSI colors."""
+    mime = cf.mime_type.lower() if cf.mime_type else ''
+    if 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder':
+        return format_item_label(cf.name, 'folder')
+    elif 'video' in mime:
+        return format_item_label(cf.name, 'video')
+    else:
+        return format_item_label(cf.name, 'file')
+
+def flush_stdin():
+    """Flush any unread escape codes or keystrokes from stdin."""
+    if sys.stdin.isatty():
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except Exception:
+            pass
+
 def fzf_select(items, prompt, default_idx=None, header=None):
     if not items:
         return None
+    flush_stdin()
     footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         cmd = [
             "fzf",
-            "--no-clear",
+            "--ansi",
+            "--color=prompt:cyan:bold,header:247,footer:247",
             "--reverse",
             "--cycle",
             "--prompt", prompt,
@@ -242,7 +272,7 @@ def fzf_select(items, prompt, default_idx=None, header=None):
             
         text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
         p = subprocess.run(cmd, input=text, text=True, capture_output=True)
-        if p.returncode == 0 and p.stdout:
+        if p.returncode in (0, 1) and p.stdout:
             lines = p.stdout.splitlines()
             if lines:
                 key_pressed = lines[0].strip().lower()
@@ -256,10 +286,10 @@ def fzf_select(items, prompt, default_idx=None, header=None):
         return None
     
     if header:
-        print(f"\033[1;35m--- {header} ---\033[0m")
+        print(f"\033[37m--- {header} ---\033[0m")
     for i, item in enumerate(items): print(f"{i+1}. {item}")
     print("0. Back")
-    print(f"\033[90m{footer_text}\033[0m\n")
+    print(f"\033[37m{footer_text}\033[0m\n")
     p_str = f"\033[1;36m{prompt}\033[0m"
     if default_idx is not None and 0 <= default_idx < len(items):
         p_str += f" [{default_idx + 1}]: "
@@ -268,6 +298,7 @@ def fzf_select(items, prompt, default_idx=None, header=None):
 
 def fzf_search_prompt():
     """Run search prompt inside fzf interface when available."""
+    flush_stdin()
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         hist = load_history()
         hist_titles = list(hist.keys())
@@ -278,7 +309,7 @@ def fzf_search_prompt():
         
         cmd = [
             "fzf",
-            "--no-clear",
+            "--color=prompt:cyan:bold,header:247,footer:247",
             "--reverse",
             "--cycle",
             "--print-query",
@@ -290,25 +321,24 @@ def fzf_search_prompt():
         
         text = "\n".join(items) if items else ""
         p = subprocess.run(cmd, input=text, text=True, capture_output=True)
-        if p.returncode == 0 and p.stdout:
+        if p.stdout:
             lines = p.stdout.splitlines()
-            if lines:
-                typed_query = lines[0].strip()
-                key_pressed = lines[1].strip().lower() if len(lines) > 1 else ""
-                selected_item = lines[2].strip() if len(lines) > 2 else ""
+            typed_query = lines[0].strip() if len(lines) > 0 else ""
+            key_pressed = lines[1].strip().lower() if len(lines) > 1 else ""
+            selected_item = lines[2].strip() if len(lines) > 2 else ""
+            
+            if key_pressed == "left":
+                return ("exit", None)
                 
-                if key_pressed == "left":
+            if typed_query:
+                if typed_query.lower() in ("exit", "quit"):
                     return ("exit", None)
-                    
-                if selected_item and selected_item.startswith("[History] "):
-                    title = selected_item[len("[History] "):].strip()
-                    if title in hist:
-                        return ("history", (title, hist[title]))
+                return ("search", typed_query)
                 
-                if typed_query:
-                    if typed_query.lower() in ("exit", "quit"):
-                        return ("exit", None)
-                    return ("search", typed_query)
+            if selected_item and selected_item.startswith("[History] "):
+                title = selected_item[len("[History] "):].strip()
+                if title in hist:
+                    return ("history", (title, hist[title]))
                     
         return ("exit", None)
     
@@ -340,6 +370,8 @@ def check_deps(download_mode):
 
 def safe_request(method, url, max_retries=3, timeout=3, **kwargs):
     global session
+    if session is None:
+        init_session()
     with Spinner("Fetching..."):
         for attempt in range(max_retries):
             try:
@@ -423,6 +455,7 @@ def stream_in_mpv(download_url, title=None):
         logger.info(f"Launching mpv: {download_url}")
         print(f"\033[1;34mPlaying {title or ''}...\033[0m")
         subprocess.run(mpv_flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        flush_stdin()
 
 def download_file(url, output_name):
     download_dir = CONFIG.get("download_dir", ".")
@@ -442,23 +475,30 @@ def download_file(url, output_name):
     except FileNotFoundError:
         print("curl is not installed. Cannot download.")
 
-def fetch_anime_list(anime_search_url, query=None):
+def fetch_anime_list(anime_search_url, query=None, download_mode=False):
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
-        return None
+        return
     soup_anime_list = BeautifulSoup(res_search_animes.content, 'html.parser')
 
     anime_list = soup_anime_list.select('.post-item-inner > a:first-child')
     if not anime_list:
         print("No results found.")
-        return None
+        return
 
     anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
     anime_urls = [urljoin(base_url, a['href']) for a in anime_list]
     
     header = f"AnimeToki CLI | Search: '{query}'" if query else "AnimeToki CLI | Search Results"
-    idx = fzf_select(anime_names, "Select anime: ", header=header)
-    return anime_urls[idx] if idx is not None else None
+    
+    default_idx = None
+    while True:
+        idx = fzf_select(anime_names, "Select anime: ", default_idx=default_idx, header=header)
+        if idx is None:
+            break
+        default_idx = idx
+        selected_anime_url = anime_urls[idx]
+        anime_download_link(selected_anime_url, download_mode=download_mode)
 
 def classify_link(url):
     """Classify a link as cloud folder, direct video, or worker folder."""
@@ -522,16 +562,15 @@ def resolve_stream_url(url):
         
     return url
 
-def anime_download_link(selected_anime_url):
+def anime_download_link(selected_anime_url, download_mode=False):
     res_anime = safe_request('get', selected_anime_url)
     if not res_anime:
-        return None
+        return
     soup_anime_list = BeautifulSoup(res_anime.content, 'html.parser')
 
     anime_title = soup_anime_list.find('h1', class_="post-title entry-title")
     title_text = anime_title.get_text().strip() if anime_title else "Unknown"
     update_history(title_text, selected_anime_url)
-    print(f"> {title_text}")
 
     # Find cloud links (completed anime)
     cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"]')
@@ -545,7 +584,7 @@ def anime_download_link(selected_anime_url):
     
     if not all_links:
         print("No streaming links found for this anime.")
-        return None
+        return
 
     link_data = []  # list of (label, full_url, link_type)
     for link in all_links:
@@ -554,34 +593,41 @@ def anime_download_link(selected_anime_url):
         link_type = classify_link(href)
         link_data.append((label, href, link_type))
 
-    labels = [f"{l} [{'▶' if t == 'direct_video' else '🗁' if t == 'worker_folder' else ' '}]" for l, _, t in link_data]
+    labels = [format_item_label(l, t) for l, _, t in link_data]
     header = f"AnimeToki CLI | {title_text}"
-    idx = fzf_select(labels, "Select source: ", header=header)
-    if idx is None: return None
-    
-    label, selected_url, link_type = link_data[idx]
-    stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
-    hist_ctx = HistoryContext(
-        title=title_text,
-        anime_url=selected_anime_url,
-        source_label=label,
-        source_type=stype,
-        source_url=selected_url
-    )
-    
-    if link_type == 'cloud':
-        segments = [base64.b64encode(unquote(s).encode()).decode() for s in urlparse(selected_url).path.split('/') if s]
-        return {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
-    elif link_type == 'direct_video':
-        # Collect all direct video links for episode navigation
-        direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
-        selected_ep_idx = next(i for i, (l, u) in enumerate(direct_episodes) if u == selected_url)
-        return {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx, "hist_ctx": hist_ctx}
-    elif link_type == 'worker_folder':
-        return {"type": "worker_folder", "url": selected_url, "hist_ctx": hist_ctx}
-    else:
-        # Unknown type, try opening as direct URL
-        return {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
+
+    default_idx = None
+    while True:
+        idx = fzf_select(labels, "Select source: ", default_idx=default_idx, header=header)
+        if idx is None:
+            break
+        
+        default_idx = idx
+        label, selected_url, link_type = link_data[idx]
+        stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
+        hist_ctx = HistoryContext(
+            title=title_text,
+            anime_url=selected_anime_url,
+            source_label=label,
+            source_type=stype,
+            source_url=selected_url
+        )
+        
+        if link_type == 'cloud':
+            segments = [base64.b64encode(unquote(s).encode()).decode() for s in urlparse(selected_url).path.split('/') if s]
+            result = {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
+        elif link_type == 'direct_video':
+            # Collect all direct video links for episode navigation
+            direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
+            selected_ep_idx = next((i for i, (l, u) in enumerate(direct_episodes) if u == selected_url), 0)
+            result = {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx, "hist_ctx": hist_ctx}
+        elif link_type == 'worker_folder':
+            result = {"type": "worker_folder", "url": selected_url, "hist_ctx": hist_ctx}
+        else:
+            # Unknown type, try opening as direct URL
+            result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
+        
+        _dispatch_result(result, download_mode)
 
 def fetch_content(url):    
     """Fetch folder content from cloud API and return list of CloudFile objects and node_index."""
@@ -672,7 +718,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
                 logger.debug("Worker folder unreachable and stack exhausted.")
                 return False
         
-        labels = [f"{l} [{'▶' if t == 'direct_video' else '🗁' if t == 'worker_folder' else ' '}]" for l, _, t in entries]
+        labels = [format_item_label(l, t) for l, _, t in entries]
         default_idx = None
         if default_highlight:
             default_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None)
@@ -725,7 +771,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
 
     header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Episodes'}"
     if resume:
-        res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx, header=header)
+        res = fzf_select([format_item_label(e[0], "video") for e in episodes], "Select episode: ", default_idx=idx, header=header)
         if res is None:
             return True
         idx = res
@@ -747,7 +793,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
         elif act == 1: pass
         elif act == 2: idx = max(idx - 1, 0)
         elif act == 3:
-            res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx, header=header)
+            res = fzf_select([format_item_label(e[0], "video") for e in episodes], "Select episode: ", default_idx=idx, header=header)
             if res is None: return True
             idx = res
         else: return True
@@ -771,7 +817,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             
         last_name = resume_from.get("selected_file_name")
         default_idx = next((i for i, f in enumerate(files) if f.name == last_name), None) if (files and last_name) else None
-        idx = fzf_select([f.name for f in files], "Select file: ", default_idx=default_idx, header=header)
+        idx = fzf_select([format_cloud_file_label(f) for f in files], "Select file: ", default_idx=default_idx, header=header)
         if idx is None:
             return True
         selected_file = files[idx]
@@ -782,11 +828,30 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
         if files is None and current_folder_url:
             files, _ = fetch_content(current_folder_url)
 
-    if hist_ctx and selected_file:
-        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
-
     while True:
-        if selected_file and "video" in selected_file.mime_type: 
+        if not selected_file:
+            if not files:
+                if folder_stack:
+                    current_folder_url = folder_stack.pop()
+                    files, _ = fetch_content(current_folder_url)
+                    continue
+                return True
+
+            idx = fzf_select([format_cloud_file_label(f) for f in files], "Select file: ", header=header)
+            if idx is None:
+                if folder_stack:
+                    current_folder_url = folder_stack.pop()
+                    files, _ = fetch_content(current_folder_url)
+                    continue
+                return True
+
+            selected_file = files[idx]
+
+        if hist_ctx and selected_file:
+            save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
+
+        is_video = bool(selected_file.mime_type and "video" in selected_file.mime_type.lower())
+        if is_video:
             download_url = _cloud_dl_url(selected_file)
             if download_mode:
                 download_file(download_url, selected_file.name)
@@ -794,7 +859,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             stream_in_mpv(download_url, title=selected_file.name)
             
             # build sibling video list for next/prev
-            video_siblings = [f for f in files if f.mime_type and "video" in f.mime_type] if files else []
+            video_siblings = [f for f in files if f.mime_type and "video" in f.mime_type.lower()] if files else []
             vid_idx = next((j for j, f in enumerate(video_siblings) if f.name == selected_file.name), 0)
             
             while True:
@@ -813,34 +878,17 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                     if hist_ctx:
                         save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
                     stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
-                elif act == 3: break
-                else: return True
-            files, _ = fetch_content(current_folder_url)
+                elif act == 3:
+                    selected_file = None
+                    break
+                else:
+                    return True
+            selected_file = None
         else:
             folder_stack.append(current_folder_url)
             current_folder_url += base64.b64encode(unquote(selected_file.name).encode()).decode() + "/"
             files, _ = fetch_content(current_folder_url)
-
-        while True:
-            if not files:
-                if folder_stack:
-                    current_folder_url = folder_stack.pop()
-                    files, _ = fetch_content(current_folder_url)
-                    continue
-                return True
-                
-            idx = fzf_select([f.name for f in files], "Select file: ", header=header)
-            if idx is None:
-                if folder_stack:
-                    current_folder_url = folder_stack.pop()
-                    files, _ = fetch_content(current_folder_url)
-                    continue
-                return True
-                
-            selected_file = files[idx]
-            if hist_ctx:
-                save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
-            break
+            selected_file = None
     return True
 
 def _dispatch_result(result, download_mode):
@@ -852,7 +900,7 @@ def _dispatch_result(result, download_mode):
         if not files:
             return
         header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Cloud'}"
-        idx = fzf_select([f.name for f in files], "Select file: ", header=header)
+        idx = fzf_select([format_cloud_file_label(f) for f in files], "Select file: ", header=header)
         if idx is None: return
         play_and_browse(selected_file=files[idx], current_files=files, initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "direct_episodes":
@@ -868,8 +916,7 @@ def resume_history(title, entry, download_mode=False):
     if not source_type or not anime_url:
         logger.debug(f"Legacy entry or missing source_type for '{title}'. Navigating from home URL.")
         if anime_url:
-            res = anime_download_link(anime_url)
-            _dispatch_result(res, download_mode)
+            anime_download_link(anime_url, download_mode=download_mode)
         return
 
     hist_ctx = HistoryContext(
@@ -881,7 +928,7 @@ def resume_history(title, entry, download_mode=False):
     )
 
     if source_type == "cloud":
-        ok = play_and_browse(
+        play_and_browse(
             selected_file=None,
             current_files=None,
             initial_link_base64=None,
@@ -889,44 +936,30 @@ def resume_history(title, entry, download_mode=False):
             hist_ctx=hist_ctx,
             resume_from=entry
         )
-        if not ok:
-            print("Failed to reach saved cloud folder. Falling back to anime home page.")
-            res = anime_download_link(anime_url)
-            _dispatch_result(res, download_mode)
+        if anime_url:
+            anime_download_link(anime_url, download_mode=download_mode)
 
     elif source_type == "direct_episodes":
         episodes = entry.get("episodes", [])
         selected_idx = entry.get("selected_idx", 0)
-        if not episodes:
-            print("No episodes recorded. Falling back to anime home page.")
-            res = anime_download_link(anime_url)
-            _dispatch_result(res, download_mode)
-        else:
+        if episodes:
             play_direct_episodes(episodes, selected_idx, download_mode=download_mode, hist_ctx=hist_ctx, resume=True)
+        if anime_url:
+            anime_download_link(anime_url, download_mode=download_mode)
 
     elif source_type == "worker_folder":
         url = entry.get("current_folder_url") or entry.get("source_url")
-        if not url:
-            res = anime_download_link(anime_url)
-            _dispatch_result(res, download_mode)
-        else:
-            ok = browse_worker_folder(url, download_mode=download_mode, hist_ctx=hist_ctx, resume_from=entry)
-            if not ok:
-                print("Failed to reach saved worker folder. Falling back to anime home page.")
-                res = anime_download_link(anime_url)
-                _dispatch_result(res, download_mode)
+        if url:
+            browse_worker_folder(url, download_mode=download_mode, hist_ctx=hist_ctx, resume_from=entry)
+        if anime_url:
+            anime_download_link(anime_url, download_mode=download_mode)
     else:
-        res = anime_download_link(anime_url)
-        _dispatch_result(res, download_mode)
+        if anime_url:
+            anime_download_link(anime_url, download_mode=download_mode)
 
 def search(query, download_mode=False):
     anime_search_url = search_url + query
-    selected_anime_url = fetch_anime_list(anime_search_url, query=query)
-    if not selected_anime_url:
-        return
-        
-    result = anime_download_link(selected_anime_url)
-    _dispatch_result(result, download_mode)
+    fetch_anime_list(anime_search_url, query=query, download_mode=download_mode)
 
 def signal_handler(sig, frame):
     exit_alt_screen()
@@ -967,8 +1000,8 @@ def main():
 
     enter_alt_screen()
 
-    while True:
-        try:
+    try:
+        while True:
             if args.continue_watch:
                 hist = load_history()
                 if not hist:
@@ -999,13 +1032,12 @@ def main():
                     resume_history(title, entry, args.download)
                 elif action == "search":
                     search(payload, args.download)
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting...")
-            break
-        except Exception as e:
-            print(f"An error occurred: {e}")
-        finally:
-            exit_alt_screen()
+    except (EOFError, KeyboardInterrupt):
+        print("\nExiting...")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        exit_alt_screen()
 
 if __name__ == "__main__":
     main()
