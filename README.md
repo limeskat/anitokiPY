@@ -57,10 +57,12 @@ You can customize `anitokipy` by creating a JSON configuration file at `~/.confi
 - **`download_dir`**: Directory where downloaded files are saved when using `-d` / `--download`.
 
 ### Features & Navigation
+- **Unified FZF Interface**: The main search prompt runs directly inside `fzf` with recent watch history pre-loaded, eliminating terminal context switching. Type a query to search or select a history item to resume immediately.
+- **Top Status Headers**: Every menu displays a clean status/context header at the top of `fzf`.
 - **Loading Spinner**: Interactive terminal spinner provides visual feedback during network requests.
-- **Fuzzy Search & Arrow Key Navigation**: Use `fzf` to search through anime, episodes, folders, or watch history:
+- **Arrow Key Navigation**:
   - **`[← Left]`**: Go back to parent folder or previous menu.
   - **`[→ Right / Enter]`**: Select item or open subfolder.
-  Keybindings are prominently displayed in the menu footer at the bottom of the terminal.
+  Keybindings are prominently displayed in the menu footer at the bottom of the terminal screen.
 - **Post-Play Controls**: After an episode finishes (or `mpv` is closed), options appear to play `next`, `replay`, `previous`, `select` a file, or `quit`.
-- **Exit**: Type `exit` in the search prompt or press `Ctrl+D` / `Ctrl+C` to cleanly exit.
+- **Exit**: Type `exit` in the search prompt or press `Ctrl+D` / `Ctrl+C` / `[← Left]` to cleanly exit.

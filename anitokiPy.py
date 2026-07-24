@@ -10,6 +10,7 @@ import re
 import os
 import logging
 import threading
+import atexit
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
@@ -51,6 +52,24 @@ def load_config():
 CONFIG = load_config()
 UA = CONFIG.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0")
 
+_alt_screen_active = False
+
+def enter_alt_screen():
+    global _alt_screen_active
+    if not _alt_screen_active and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
+        sys.stdout.write("\033[?1049h\033[H\033[2J")
+        sys.stdout.flush()
+        _alt_screen_active = True
+
+def exit_alt_screen():
+    global _alt_screen_active
+    if _alt_screen_active and sys.stdout.isatty():
+        sys.stdout.write("\033[?1049l")
+        sys.stdout.flush()
+        _alt_screen_active = False
+
+atexit.register(exit_alt_screen)
+
 def is_termux():
     return os.environ.get('TERMUX_VERSION') is not None or os.path.isdir('/data/data/com.termux')
 
@@ -82,7 +101,7 @@ class HistoryContext:
         self.source_url = source_url
 
 class Spinner:
-    def __init__(self, message="Loading..."):
+    def __init__(self, message="Fetching..."):
         self.message = message
         self.stop_event = threading.Event()
         self.thread = None
@@ -92,7 +111,7 @@ class Spinner:
         idx = 0
         while not self.stop_event.is_set():
             if sys.stdout.isatty():
-                sys.stdout.write(f"\r\033[K{chars[idx % len(chars)]} {self.message}")
+                sys.stdout.write(f"\r\033[K\033[1;36m[AnimeToki CLI]\033[0m {chars[idx % len(chars)]} {self.message}")
                 sys.stdout.flush()
             idx += 1
             time.sleep(0.08)
@@ -200,13 +219,14 @@ def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
     }
     save_history_entry(hist_ctx.title, payload)
 
-def fzf_select(items, prompt, default_idx=None):
+def fzf_select(items, prompt, default_idx=None, header=None):
     if not items:
         return None
     footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         cmd = [
             "fzf",
+            "--no-clear",
             "--reverse",
             "--cycle",
             "--prompt", prompt,
@@ -215,6 +235,8 @@ def fzf_select(items, prompt, default_idx=None):
             "--expect=left,right",
             f"--footer={footer_text}\n "
         ]
+        if header:
+            cmd.append(f"--header={header}")
         if default_idx is not None and 0 <= default_idx < len(items):
             cmd.append(f"--bind=start:pos({default_idx + 1})")
             
@@ -233,14 +255,71 @@ def fzf_select(items, prompt, default_idx=None):
                         pass
         return None
     
+    if header:
+        print(f"\033[1;35m--- {header} ---\033[0m")
     for i, item in enumerate(items): print(f"{i+1}. {item}")
     print("0. Back")
-    print(f"\033[90m{footer_text}\033[0m")
+    print(f"\033[90m{footer_text}\033[0m\n")
     p_str = f"\033[1;36m{prompt}\033[0m"
     if default_idx is not None and 0 <= default_idx < len(items):
         p_str += f" [{default_idx + 1}]: "
     idx = safe_input(p_str, len(items), default_val=default_idx + 1 if default_idx is not None else None)
     return idx - 1 if idx > 0 else None
+
+def fzf_search_prompt():
+    """Run search prompt inside fzf interface when available."""
+    if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
+        hist = load_history()
+        hist_titles = list(hist.keys())
+        items = [f"[History] {t}" for t in hist_titles]
+        
+        header = "AnimeToki CLI | Search anime or select history to resume"
+        footer = " [ ← / ESC ] Exit  |  [ Enter ] Search / Resume \n "
+        
+        cmd = [
+            "fzf",
+            "--no-clear",
+            "--reverse",
+            "--cycle",
+            "--print-query",
+            "--prompt=Search anime: ",
+            "--expect=left",
+            f"--header={header}",
+            f"--footer={footer}"
+        ]
+        
+        text = "\n".join(items) if items else ""
+        p = subprocess.run(cmd, input=text, text=True, capture_output=True)
+        if p.returncode == 0 and p.stdout:
+            lines = p.stdout.splitlines()
+            if lines:
+                typed_query = lines[0].strip()
+                key_pressed = lines[1].strip().lower() if len(lines) > 1 else ""
+                selected_item = lines[2].strip() if len(lines) > 2 else ""
+                
+                if key_pressed == "left":
+                    return ("exit", None)
+                    
+                if selected_item and selected_item.startswith("[History] "):
+                    title = selected_item[len("[History] "):].strip()
+                    if title in hist:
+                        return ("history", (title, hist[title]))
+                
+                if typed_query:
+                    if typed_query.lower() in ("exit", "quit"):
+                        return ("exit", None)
+                    return ("search", typed_query)
+                    
+        return ("exit", None)
+    
+    # Fallback to standard terminal input
+    try:
+        query = input("\033[1;36mSearch anime: \033[0m").strip()
+        if not query or query.lower() in ("exit", "quit"):
+            return ("exit", None)
+        return ("search", query)
+    except (EOFError, KeyboardInterrupt):
+        return ("exit", None)
 
 def init_session():
     global session
@@ -363,7 +442,7 @@ def download_file(url, output_name):
     except FileNotFoundError:
         print("curl is not installed. Cannot download.")
 
-def fetch_anime_list(anime_search_url):
+def fetch_anime_list(anime_search_url, query=None):
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
         return None
@@ -377,7 +456,8 @@ def fetch_anime_list(anime_search_url):
     anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
     anime_urls = [urljoin(base_url, a['href']) for a in anime_list]
     
-    idx = fzf_select(anime_names, "Select anime: ")
+    header = f"AnimeToki CLI | Search: '{query}'" if query else "AnimeToki CLI | Search Results"
+    idx = fzf_select(anime_names, "Select anime: ", header=header)
     return anime_urls[idx] if idx is not None else None
 
 def classify_link(url):
@@ -475,7 +555,8 @@ def anime_download_link(selected_anime_url):
         link_data.append((label, href, link_type))
 
     labels = [f"{l} [{'▶' if t == 'direct_video' else '🗁' if t == 'worker_folder' else ' '}]" for l, _, t in link_data]
-    idx = fzf_select(labels, "Select source: ")
+    header = f"AnimeToki CLI | {title_text}"
+    idx = fzf_select(labels, "Select source: ", header=header)
     if idx is None: return None
     
     label, selected_url, link_type = link_data[idx]
@@ -580,6 +661,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
         current_url = url
         default_highlight = None
     
+    header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Worker Folder'}"
     while True:
         entries = fetch_worker_folder(current_url)
         if not entries:
@@ -596,7 +678,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
             default_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None)
             default_highlight = None
             
-        idx = fzf_select(labels, "Select: ", default_idx=default_idx)
+        idx = fzf_select(labels, "Select: ", default_idx=default_idx, header=header)
         
         if idx is None:
             if folder_stack:
@@ -622,7 +704,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
                     download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
                     return True
                 stream_in_mpv(stream_url, title=label)
-                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ")
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=header)
                 if act == 0: vid_idx = min(vid_idx + 1, len(video_entries) - 1)
                 elif act == 1: pass
                 elif act == 2: vid_idx = max(vid_idx - 1, 0)
@@ -641,8 +723,9 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
     if idx < 0 or idx >= len(episodes):
         idx = 0
 
+    header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Episodes'}"
     if resume:
-        res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx)
+        res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx, header=header)
         if res is None:
             return True
         idx = res
@@ -658,13 +741,13 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
             return True
             
         stream_in_mpv(stream_url, title=label)
-        act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ")
+        act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=header)
         
         if act == 0: idx = min(idx + 1, len(episodes) - 1)
         elif act == 1: pass
         elif act == 2: idx = max(idx - 1, 0)
         elif act == 3:
-            res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx)
+            res = fzf_select([e[0] for e in episodes], "Select episode: ", default_idx=idx, header=header)
             if res is None: return True
             idx = res
         else: return True
@@ -674,6 +757,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
     def _cloud_dl_url(cf: CloudFile):
         return f"{base_cloud_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
 
+    header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Cloud Folder'}"
     if resume_from:
         current_folder_url = resume_from["current_folder_url"]
         folder_stack = list(resume_from.get("folder_stack", []))
@@ -687,7 +771,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             
         last_name = resume_from.get("selected_file_name")
         default_idx = next((i for i, f in enumerate(files) if f.name == last_name), None) if (files and last_name) else None
-        idx = fzf_select([f.name for f in files], "Select file: ", default_idx=default_idx)
+        idx = fzf_select([f.name for f in files], "Select file: ", default_idx=default_idx, header=header)
         if idx is None:
             return True
         selected_file = files[idx]
@@ -714,7 +798,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             vid_idx = next((j for j, f in enumerate(video_siblings) if f.name == selected_file.name), 0)
             
             while True:
-                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {selected_file.name}... ")
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {selected_file.name}... ", header=header)
                 if act == 0:
                     vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
                     selected_file = video_siblings[vid_idx]
@@ -745,7 +829,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                     continue
                 return True
                 
-            idx = fzf_select([f.name for f in files], "Select file: ")
+            idx = fzf_select([f.name for f in files], "Select file: ", header=header)
             if idx is None:
                 if folder_stack:
                     current_folder_url = folder_stack.pop()
@@ -767,7 +851,8 @@ def _dispatch_result(result, download_mode):
         files, _ = fetch_content(result["url"])
         if not files:
             return
-        idx = fzf_select([f.name for f in files], "Select file: ")
+        header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Cloud'}"
+        idx = fzf_select([f.name for f in files], "Select file: ", header=header)
         if idx is None: return
         play_and_browse(selected_file=files[idx], current_files=files, initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "direct_episodes":
@@ -836,7 +921,7 @@ def resume_history(title, entry, download_mode=False):
 
 def search(query, download_mode=False):
     anime_search_url = search_url + query
-    selected_anime_url = fetch_anime_list(anime_search_url)
+    selected_anime_url = fetch_anime_list(anime_search_url, query=query)
     if not selected_anime_url:
         return
         
@@ -844,6 +929,7 @@ def search(query, download_mode=False):
     _dispatch_result(result, download_mode)
 
 def signal_handler(sig, frame):
+    exit_alt_screen()
     print("\nExiting...")
     sys.exit(0)
 
@@ -879,6 +965,8 @@ def main():
         print("History cleared.")
         return
 
+    enter_alt_screen()
+
     while True:
         try:
             if args.continue_watch:
@@ -888,7 +976,7 @@ def main():
                     return
                 else:
                     titles = list(hist.keys())
-                    idx = fzf_select(titles, "Select history: ")
+                    idx = fzf_select(titles, "Select history: ", header="AnimeToki CLI | Watch History")
                     if idx is not None:
                         selected_title = titles[idx]
                         entry = hist[selected_title]
@@ -899,16 +987,25 @@ def main():
             if initial_query:
                 query = initial_query
                 initial_query = None
+                if query:
+                    search(query, args.download)
             else:
-                query = input("\033[1;36mSearch anime: \033[0m").strip()
-                if query.lower() == "exit": break
-            
-            if query: search(query, args.download)
+                action, payload = fzf_search_prompt()
+                if action == "exit":
+                    print("\nExiting...")
+                    break
+                elif action == "history":
+                    title, entry = payload
+                    resume_history(title, entry, args.download)
+                elif action == "search":
+                    search(payload, args.download)
         except (EOFError, KeyboardInterrupt):
             print("\nExiting...")
             break
         except Exception as e:
             print(f"An error occurred: {e}")
+        finally:
+            exit_alt_screen()
 
 if __name__ == "__main__":
     main()
