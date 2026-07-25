@@ -14,6 +14,7 @@ import threading
 import atexit
 from dataclasses import dataclass
 from pathlib import Path
+import urllib.request
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests as cffi_requests
@@ -80,7 +81,7 @@ def is_termux():
 
 base_url = "https://animetoki.com"
 search_url = "https://animetoki.com/?s="
-base_cloud_url = "https://cloud.animetoki.com/"
+
 session = None
 hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
 
@@ -88,7 +89,9 @@ def _cookie_header():
     return "; ".join(f"{name}={value}" for name, value in session.cookies.items())
 
 def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+    s_norm = re.sub(r'[^\w\s]', ' ', s.lower())
+    s_norm = re.sub(r'\s+', ' ', s_norm).strip()
+    return [int(text) if text.isdigit() else text for text in re.split('([0-9]+)', s_norm)]
 
 @dataclass
 class CloudFile:
@@ -115,17 +118,45 @@ class Spinner:
     def _spin(self):
         chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         idx = 0
+        use_fzf_box = _alt_screen_active or (shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty())
+
         while not self.stop_event.is_set():
+            char = chars[idx % len(chars)]
             if sys.stdout.isatty():
-                sys.stdout.write(f"\r\033[K\033[1;36m[AnimeToki CLI]\033[0m {chars[idx % len(chars)]} {self.message}")
-                sys.stdout.flush()
+                if use_fzf_box:
+                    cols, rows = shutil.get_terminal_size((80, 24))
+                    title = " AnimeToki CLI "
+                    pad_top = max(0, (cols - len(title) - 2) // 2)
+                    pad_rem = max(0, cols - len(title) - 2 - pad_top)
+                    border_top = "╭" + "─" * pad_top + title + "─" * pad_rem + "╮"
+                    border_bot = "╰" + "─" * (cols - 2) + "╯"
+                    empty_line = "│" + " " * (cols - 2) + "│"
+                    
+                    msg_str = f"{char} {self.message}"
+                    pad_msg = max(0, (cols - 2 - len(msg_str)) // 2)
+                    pad_msg_rem = max(0, cols - 2 - pad_msg - len(msg_str))
+                    msg_line = "│" + " " * pad_msg + f"\033[1;36m{char}\033[0m {self.message}" + " " * pad_msg_rem + "│"
+                    
+                    mid_row = rows // 2
+                    out = ["\033[H", border_top]
+                    for r in range(1, rows - 1):
+                        out.append(msg_line if r == mid_row else empty_line)
+                    out.append(border_bot)
+                    sys.stdout.write("".join(out))
+                    sys.stdout.flush()
+                else:
+                    sys.stdout.write(f"\r\033[K\033[1;36m  > \033[0m\033[36m{char}\033[0m {self.message}")
+                    sys.stdout.flush()
             idx += 1
             time.sleep(0.08)
-        if sys.stdout.isatty():
+
+        if not use_fzf_box and sys.stdout.isatty():
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
 
     def __enter__(self):
+        if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
+            enter_alt_screen()
         if sys.stdout.isatty():
             self.thread = threading.Thread(target=self._spin, daemon=True)
             self.thread.start()
@@ -244,12 +275,52 @@ def format_bytes(size):
     except Exception:
         return ""
 
+def truncate_middle(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    half = (max_len - 2) // 2
+    remainder = max_len - 2 - half
+    return text[:half] + ".." + text[-remainder:]
+
 def build_header(path_parts: list, items_info: str = "") -> str:
-    """Build a clean 2-line header with AnimeToki CLI and dynamic breadcrumb path."""
-    clean_parts = [str(p).strip('/') for p in path_parts if p and str(p).strip('/')]
-    path_str = "/" + "/".join(clean_parts) if clean_parts else "/"
+    """Build a clean header with dynamic breadcrumb path truncated to fit terminal width."""
+    cols, _ = shutil.get_terminal_size((80, 24))
+    clean_parts = []
+    for p in path_parts:
+        if p:
+            s = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', str(p), flags=re.IGNORECASE).strip('/')
+            if s:
+                clean_parts.append(s)
+    
+    info_plain = f"  ({items_info})" if items_info else ""
+    max_path_len = max(15, cols - len(info_plain) - 6)
+    
+    if clean_parts:
+        full_path = "/" + "/".join(clean_parts) + "/"
+        if len(full_path) > max_path_len:
+            part_budget = max(8, (max_path_len - len(clean_parts) - 2) // len(clean_parts))
+            truncated_parts = [truncate_middle(p, part_budget) if len(p) > part_budget else p for p in clean_parts]
+            full_path = "/" + "/".join(truncated_parts) + "/"
+            if len(full_path) > max_path_len:
+                full_path = truncate_middle(full_path, max_path_len)
+        path_str = full_path
+    else:
+        path_str = "/"
+
     info_suffix = f"  \033[90m({items_info})\033[0m" if items_info else ""
-    return f"AnimeToki CLI\nPath: {path_str}{info_suffix}"
+    return f"{path_str}{info_suffix}"
+
+def build_footer(actions: list) -> str:
+    """Build a clean CLI footer string from (key, action_label) tuples or strings."""
+    parts = []
+    for item in actions:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            parts.append(f" [ {item[0]} ] {item[1]} ")
+        else:
+            parts.append(str(item))
+    return " │ ".join(parts)
 
 def count_items_summary(items_or_files):
     """Return a string like '12 Files, 2 Folders' for header stats."""
@@ -281,14 +352,33 @@ def count_items_summary(items_or_files):
     return ", ".join(parts)
 
 def format_item_label(name: str, item_type: str, size_str: str = "") -> str:
-    """Format label with type icon, file size, and ANSI colors: Skinish peach for folders, White for files/videos."""
-    size_suffix = f"  \033[90m({size_str})\033[0m" if size_str else ""
-    if item_type in ('folder', 'worker_folder', 'cloud'):
-        return f"\033[1;38;5;215m🗁  {name}\033[0m"
-    elif item_type in ('video', 'direct_video', 'file'):
-        return f"\033[1;37m▶  {name}\033[0m{size_suffix}"
+    """Format label with type icon, right-aligned file size (no brackets), and ANSI colors."""
+    name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE)
+    cols, _ = shutil.get_terminal_size((80, 24))
+    avail_width = max(30, cols - 8)
+
+    if size_str:
+        plain_size = size_str.strip('()')
+        if item_type in ('folder', 'worker_folder', 'cloud'):
+            left_plain = f"🗁  {name}"
+            left_ansi = f"\033[1;38;5;215m🗁  {name}\033[0m"
+        elif item_type in ('video', 'direct_video', 'file'):
+            left_plain = f"▶  {name}"
+            left_ansi = f"\033[1;37m▶  {name}\033[0m"
+        else:
+            left_plain = f"   {name}"
+            left_ansi = f"\033[0m   {name}"
+
+        pad_count = max(2, avail_width - len(left_plain) - len(plain_size))
+        spaces = " " * pad_count
+        return f"{left_ansi}{spaces}\033[90m{plain_size}\033[0m"
     else:
-        return f"\033[0m   {name}{size_suffix}"
+        if item_type in ('folder', 'worker_folder', 'cloud'):
+            return f"\033[1;38;5;215m🗁  {name}\033[0m"
+        elif item_type in ('video', 'direct_video', 'file'):
+            return f"\033[1;37m▶  {name}\033[0m"
+        else:
+            return f"\033[0m   {name}"
 
 def format_cloud_file_label(cf: CloudFile) -> str:
     """Format CloudFile with type icon, file size, and ANSI colors."""
@@ -309,24 +399,33 @@ def flush_stdin():
         except Exception:
             pass
 
-def fzf_select(items, prompt, default_idx=None, header=None):
+def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
     if not items:
         return None
     flush_stdin()
-    footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
+    if isinstance(footer, list):
+        footer_text = build_footer(footer)
+    elif isinstance(footer, str):
+        footer_text = footer
+    else:
+        footer_text = build_footer([("Enter / →", "Select"), ("ESC / ←", "Back")])
 
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         cmd = [
             "fzf",
             "--ansi",
-            "--color=prompt:cyan:bold,header:247,footer:247",
+            "--border=rounded",
+            "--border-label= AnimeToki CLI ",
+            "--info=inline: ",
+            "--header-border=bottom",
+            "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
             "--reverse",
             "--cycle",
             "--prompt", prompt,
             "--with-nth=2",
             "--delimiter=\t",
             "--expect=left,right",
-            f"--footer={footer_text}\n "
+            f"--footer={footer_text}"
         ]
         if header:
             cmd.append(f"--header={header}")
@@ -354,7 +453,7 @@ def fzf_select(items, prompt, default_idx=None, header=None):
         return None
     
     if header:
-        print(f"\033[37m--- {header} ---\033[0m")
+        print(f"\033[37m--- AnimeToki CLI | {header} ---\033[0m")
     for i, item in enumerate(items): print(f"{i+1}. {item}")
     print("0. Back")
     print(f"\033[37m{footer_text}\033[0m\n")
@@ -374,16 +473,20 @@ def fzf_search_prompt():
         hist_titles = list(hist.keys())
         items = [f"[History] {t}" for t in hist_titles]
         
-        header = build_header(['search'], "Type to search or select history")
-        footer = " [ ← / ESC ] Exit  |  [ Enter ] Search / Resume \n "
+        header = build_header(['search'])
+        footer = build_footer([("Enter", "Search / Resume"), ("ESC / ←", "Exit")])
         
         cmd = [
             "fzf",
-            "--color=prompt:cyan:bold,header:247,footer:247",
+            "--border=rounded",
+            "--border-label= AnimeToki CLI ",
+            "--info=inline: ",
+            "--header-border=bottom",
+            "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
             "--reverse",
             "--cycle",
             "--print-query",
-            "--prompt=Search anime: ",
+            "--prompt=  > ",
             "--expect=left",
             f"--header={header}",
             f"--footer={footer}"
@@ -418,7 +521,7 @@ def fzf_search_prompt():
     
     # Fallback to standard terminal input
     try:
-        query = input("\033[1;36mSearch anime: \033[0m").strip()
+        query = input("\033[1;36m> \033[0m").strip()
         if not query or query.lower() in ("exit", "quit"):
             return ("exit", None)
         return ("search", query)
@@ -431,6 +534,7 @@ def init_session():
     try:
         session.get("https://animetoki.com", timeout=3)
         session.get("https://cloud.animetoki.com", timeout=3)
+        session.get("https://drive.animetoki.com", timeout=3)
     except Exception as e:
         print(f"Warning: Failed to warm up session: {e}")
 
@@ -635,7 +739,7 @@ def classify_link(url):
     path_lower = parsed.path.lower()
     query_lower = parsed.query.lower()
     
-    if 'cloud.animetoki.com' in parsed.netloc:
+    if 'cloud.animetoki.com' in parsed.netloc or 'drive.animetoki.com' in parsed.netloc:
         return 'cloud'
     
     # Check if it's a direct video file (path ends with video ext, or has ?a=view)
@@ -701,12 +805,12 @@ def anime_download_link(selected_anime_url, download_mode=False):
     update_history(title_text, selected_anime_url)
 
     # Find cloud links (completed anime)
-    cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"]')
+    cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
     # Find workers.dev / CDN links (ongoing anime)
     cdn_links = soup_anime_list.select('a.shortc-button[href]')
     # Filter cdn_links to exclude cloud links (already captured) and non-download links
     cdn_links = [a for a in cdn_links 
-                 if a.get('href') and not a['href'].startswith('//cloud.animetoki.com/')]
+                 if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
     
     all_links = list(cloud_links) + list(cdn_links)
     
@@ -744,8 +848,10 @@ def anime_download_link(selected_anime_url, download_mode=False):
         )
         
         if link_type == 'cloud':
-            segments = [base64.b64encode(unquote(s).encode()).decode() for s in urlparse(selected_url).path.split('/') if s]
-            result = {"type": "cloud", "url": base_cloud_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
+            parsed = urlparse(selected_url)
+            domain_url = f"https://{parsed.netloc}/"
+            segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
+            result = {"type": "cloud", "url": domain_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
         elif link_type == 'direct_video':
             # Collect all direct video links for episode navigation
             direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
@@ -951,7 +1057,9 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
 
 def play_and_browse(selected_file=None, current_files=None, initial_link_base64=None, download_mode=False, hist_ctx=None, resume_from=None):
     def _cloud_dl_url(cf: CloudFile):
-        return f"{base_cloud_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
+        parsed = urlparse(current_folder_url)
+        domain_url = f"https://{parsed.netloc}"
+        return f"{domain_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
 
     if resume_from:
         current_folder_url = resume_from["current_folder_url"]
