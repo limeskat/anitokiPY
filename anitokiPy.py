@@ -17,6 +17,10 @@ from pathlib import Path
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests as cffi_requests
+try:
+    import termios
+except ImportError:
+    termios = None
 
 log_dir = Path.home() / ".local" / "share" / "anitokipy"
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -51,7 +55,7 @@ def load_config():
     return defaults
 
 CONFIG = load_config()
-UA = CONFIG.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0")
+UA = CONFIG["user_agent"]
 
 _alt_screen_active = False
 
@@ -93,13 +97,13 @@ class CloudFile:
     mime_type: str
     node_index: str
 
+@dataclass
 class HistoryContext:
-    def __init__(self, title, anime_url, source_label="", source_type="", source_url=""):
-        self.title = title
-        self.anime_url = anime_url
-        self.source_label = source_label
-        self.source_type = source_type
-        self.source_url = source_url
+    title: str
+    anime_url: str
+    source_label: str = ""
+    source_type: str = ""
+    source_url: str = ""
 
 class Spinner:
     def __init__(self, message="Fetching..."):
@@ -157,27 +161,14 @@ def save_history_entry(title, payload):
     except Exception as e:
         logger.error(f"Failed to save history: {e}")
 
-def _migrate_history_entry(data):
-    if isinstance(data, str):
-        return {
-            "anime_url": data,
-            "watched": [],
-            "version": 1
-        }
-    if isinstance(data, dict):
-        if "watched" not in data or not isinstance(data.get("watched"), list):
-            data["watched"] = []
-    return data
-
 def load_history():
     if not hist_file.exists():
         return {}
     try:
         with open(hist_file, "r") as f: hist = json.load(f)
         if isinstance(hist, dict):
-            migrated = {k: _migrate_history_entry(v) for k, v in hist.items()}
             sorted_entries = sorted(
-                migrated.items(),
+                hist.items(),
                 key=lambda item: item[1].get("last_played", "") if isinstance(item[1], dict) else "",
                 reverse=True
             )
@@ -311,9 +302,8 @@ def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
 
 def flush_stdin():
     """Flush any unread escape codes or keystrokes from stdin."""
-    if sys.stdin.isatty():
+    if sys.stdin.isatty() and termios is not None:
         try:
-            import termios
             termios.tcflush(sys.stdin, termios.TCIFLUSH)
         except Exception:
             pass
