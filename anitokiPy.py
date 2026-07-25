@@ -175,7 +175,13 @@ def load_history():
     try:
         with open(hist_file, "r") as f: hist = json.load(f)
         if isinstance(hist, dict):
-            return {k: _migrate_history_entry(v) for k, v in hist.items()}
+            migrated = {k: _migrate_history_entry(v) for k, v in hist.items()}
+            sorted_entries = sorted(
+                migrated.items(),
+                key=lambda item: item[1].get("last_played", "") if isinstance(item[1], dict) else "",
+                reverse=True
+            )
+            return dict(sorted_entries)
     except Exception as e:
         logger.debug(f"Failed to load history: {e}")
     return {}
