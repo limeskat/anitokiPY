@@ -339,7 +339,8 @@ def fzf_select(items, prompt, default_idx=None, header=None, allow_toggle=False,
         if header:
             cmd.append(f"--header={header}")
         if default_idx is not None and 0 <= default_idx < len(items):
-            cmd.append(f"--bind=start:pos({default_idx + 1})")
+            pos_str = str(default_idx + 1)
+            cmd.append(f"--bind=start:pos({pos_str}),load:pos({pos_str})")
             
         text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
         p = subprocess.run(cmd, input=text, text=True, capture_output=True)
@@ -727,11 +728,13 @@ def anime_download_link(selected_anime_url, download_mode=False):
         link_type = classify_link(href)
         link_data.append((label, href, link_type))
 
-    labels = [format_item_label(l, t) for l, _, t in link_data]
+    keys = [(l, u) for l, u, t in link_data]
+    default_idx = get_first_unwatched_idx(keys, title_text)
     header = f"AnimeToki CLI | {title_text}"
 
-    default_idx = None
     while True:
+        w_set = get_watched_set(title_text)
+        labels = [format_item_label(l, t, is_watched=(l in w_set or u in w_set)) for l, u, t in link_data]
         idx = fzf_select(labels, "Select source: ", default_idx=default_idx, header=header)
         if idx is None:
             break
@@ -753,6 +756,7 @@ def anime_download_link(selected_anime_url, download_mode=False):
         elif link_type == 'direct_video':
             # Collect all direct video links for episode navigation
             direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
+            direct_episodes.sort(key=lambda e: natural_sort_key(e[0]))
             selected_ep_idx = next((i for i, (l, u) in enumerate(direct_episodes) if u == selected_url), 0)
             result = {"type": "direct_episodes", "episodes": direct_episodes, "selected": selected_ep_idx, "hist_ctx": hist_ctx}
         elif link_type == 'worker_folder':
