@@ -96,6 +96,7 @@ class CloudFile:
     id: str
     mime_type: str
     node_index: str
+    size: int = 0
 
 @dataclass
 class HistoryContext:
@@ -177,57 +178,6 @@ def load_history():
         logger.debug(f"Failed to load history: {e}")
     return {}
 
-def get_watched_set(title):
-    if not title: return set()
-    hist = load_history()
-    entry = hist.get(title, {})
-    if isinstance(entry, dict):
-        return set(entry.get("watched", []))
-    return set()
-
-def get_first_unwatched_idx(items_keys, title, preferred_idx=None):
-    """Returns 0-based index of the first unwatched item starting from preferred_idx (or 0)."""
-    if not items_keys:
-        return 0
-    w_set = get_watched_set(title)
-    def _is_w(key):
-        if isinstance(key, (tuple, list)):
-            return any(k in w_set for k in key if k)
-        return key in w_set
-
-    start = preferred_idx if (preferred_idx is not None and 0 <= preferred_idx < len(items_keys)) else 0
-    for i in range(start, len(items_keys)):
-        if not _is_w(items_keys[i]):
-            return i
-    for i in range(0, start):
-        if not _is_w(items_keys[i]):
-            return i
-    return start
-
-def toggle_watched(title, ep_key):
-    if not title or not ep_key: return
-    hist = load_history()
-    entry = hist.get(title, {})
-    if not isinstance(entry, dict): return
-    watched = list(entry.get("watched", []))
-    if ep_key in watched:
-        watched.remove(ep_key)
-    else:
-        watched.append(ep_key)
-    entry["watched"] = watched
-    save_history_entry(title, entry)
-
-def mark_watched(title, ep_key):
-    if not title or not ep_key: return
-    hist = load_history()
-    entry = hist.get(title, {})
-    if not isinstance(entry, dict): return
-    watched = list(entry.get("watched", []))
-    if ep_key not in watched:
-        watched.append(ep_key)
-        entry["watched"] = watched
-        save_history_entry(title, entry)
-
 def update_history(title, url):
     payload = {
         "anime_url": url,
@@ -236,13 +186,14 @@ def update_history(title, url):
     }
     save_history_entry(title, payload)
 
-def save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id=None, selected_mimetype=None):
+def save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id=None, selected_mimetype=None, display_stack=None):
     payload = {
         "anime_url": hist_ctx.anime_url,
         "source_label": hist_ctx.source_label,
         "source_type": "cloud",
         "source_url": hist_ctx.source_url,
         "folder_stack": list(folder_stack),
+        "display_stack": list(display_stack) if display_stack else [],
         "current_folder_url": current_folder_url,
         "selected_file_name": selected_file_name,
         "selected_file_id": selected_file_id,
@@ -265,13 +216,14 @@ def save_direct_history(hist_ctx, episodes, selected_idx):
     }
     save_history_entry(hist_ctx.title, payload)
 
-def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
+def save_worker_history(hist_ctx, current_url, folder_stack, selected_name, display_stack=None):
     payload = {
         "anime_url": hist_ctx.anime_url,
         "source_label": hist_ctx.source_label,
         "source_type": "worker_folder",
         "source_url": hist_ctx.source_url,
         "folder_stack": list(folder_stack),
+        "display_stack": list(display_stack) if display_stack else [],
         "current_folder_url": current_url,
         "selected_file_name": selected_name,
         "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -279,26 +231,75 @@ def save_worker_history(hist_ctx, current_url, folder_stack, selected_name):
     }
     save_history_entry(hist_ctx.title, payload)
 
-def format_item_label(name: str, item_type: str, is_watched: bool = False) -> str:
-    """Format label with type icon and ANSI colors: Gray for watched, Skinish peach for folders, White for files/videos."""
-    if is_watched:
-        return f"\033[90m✓  {name}\033[0m"
+def format_bytes(size):
+    if not size:
+        return ""
+    try:
+        size = float(size)
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+    except Exception:
+        return ""
+
+def build_header(path_parts: list, items_info: str = "") -> str:
+    """Build a clean 2-line header with AnimeToki CLI and dynamic breadcrumb path."""
+    clean_parts = [str(p).strip('/') for p in path_parts if p and str(p).strip('/')]
+    path_str = "/" + "/".join(clean_parts) if clean_parts else "/"
+    info_suffix = f"  \033[90m({items_info})\033[0m" if items_info else ""
+    return f"AnimeToki CLI\nPath: {path_str}{info_suffix}"
+
+def count_items_summary(items_or_files):
+    """Return a string like '12 Files, 2 Folders' for header stats."""
+    if not items_or_files:
+        return ""
+    folders = 0
+    files = 0
+    for item in items_or_files:
+        if isinstance(item, CloudFile):
+            mime = item.mime_type.lower() if item.mime_type else ''
+            if 'folder' in mime or item.mime_type == 'application/vnd.google-apps.folder':
+                folders += 1
+            else:
+                files += 1
+        elif isinstance(item, tuple) and len(item) >= 3:
+            t = item[2]
+            if t in ('folder', 'worker_folder', 'cloud'):
+                folders += 1
+            else:
+                files += 1
+        else:
+            files += 1
+
+    parts = []
+    if files > 0:
+        parts.append(f"{files} {'File' if files == 1 else 'Files'}")
+    if folders > 0:
+        parts.append(f"{folders} {'Folder' if folders == 1 else 'Folders'}")
+    return ", ".join(parts)
+
+def format_item_label(name: str, item_type: str, size_str: str = "") -> str:
+    """Format label with type icon, file size, and ANSI colors: Skinish peach for folders, White for files/videos."""
+    size_suffix = f"  \033[90m({size_str})\033[0m" if size_str else ""
     if item_type in ('folder', 'worker_folder', 'cloud'):
         return f"\033[1;38;5;215m🗁  {name}\033[0m"
     elif item_type in ('video', 'direct_video', 'file'):
-        return f"\033[1;37m▶  {name}\033[0m"
+        return f"\033[1;37m▶  {name}\033[0m{size_suffix}"
     else:
-        return f"\033[0m   {name}"
+        return f"\033[0m   {name}{size_suffix}"
 
-def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
-    """Format CloudFile with type icon and ANSI colors."""
+def format_cloud_file_label(cf: CloudFile) -> str:
+    """Format CloudFile with type icon, file size, and ANSI colors."""
     mime = cf.mime_type.lower() if cf.mime_type else ''
+    s_str = format_bytes(cf.size) if cf.size else ""
     if 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder':
-        return format_item_label(cf.name, 'folder', is_watched=is_watched)
+        return format_item_label(cf.name, 'folder')
     elif 'video' in mime:
-        return format_item_label(cf.name, 'video', is_watched=is_watched)
+        return format_item_label(cf.name, 'video', size_str=s_str)
     else:
-        return format_item_label(cf.name, 'file', is_watched=is_watched)
+        return format_item_label(cf.name, 'file', size_str=s_str)
 
 def flush_stdin():
     """Flush any unread escape codes or keystrokes from stdin."""
@@ -308,16 +309,11 @@ def flush_stdin():
         except Exception:
             pass
 
-def fzf_select(items, prompt, default_idx=None, header=None, allow_toggle=False, return_key=False):
+def fzf_select(items, prompt, default_idx=None, header=None):
     if not items:
-        return (None, None) if return_key else None
+        return None
     flush_stdin()
-    if allow_toggle:
-        footer_text = " [ ← ] Back  |  [ → / Enter ] Select  |  [ Ctrl-W ] Toggle Watched "
-        expect_keys = "left,right,ctrl-w"
-    else:
-        footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
-        expect_keys = "left,right"
+    footer_text = " [ ← ] Back  |  [ → / Enter ] Select "
 
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         cmd = [
@@ -329,7 +325,7 @@ def fzf_select(items, prompt, default_idx=None, header=None, allow_toggle=False,
             "--prompt", prompt,
             "--with-nth=2",
             "--delimiter=\t",
-            f"--expect={expect_keys}",
+            "--expect=left,right",
             f"--footer={footer_text}\n "
         ]
         if header:
@@ -349,14 +345,13 @@ def fzf_select(items, prompt, default_idx=None, header=None, allow_toggle=False,
             if lines:
                 key_pressed = lines[0].strip().lower()
                 if key_pressed == "left":
-                    return (None, "left") if return_key else None
+                    return None
                 if len(lines) > 1 and lines[1].strip():
                     try:
-                        idx = int(lines[1].split('\t')[0])
-                        return (idx, key_pressed) if return_key else idx
+                        return int(lines[1].split('\t')[0])
                     except (ValueError, IndexError):
                         pass
-        return (None, None) if return_key else None
+        return None
     
     if header:
         print(f"\033[37m--- {header} ---\033[0m")
@@ -368,8 +363,8 @@ def fzf_select(items, prompt, default_idx=None, header=None, allow_toggle=False,
         p_str += f" [{default_idx + 1}]: "
     idx = safe_input(p_str, len(items), default_val=default_idx + 1 if default_idx is not None else None)
     if idx == 0 or idx is None:
-        return (None, "left") if return_key else None
-    return (idx - 1, "enter") if return_key else (idx - 1)
+        return None
+    return idx - 1
 
 def fzf_search_prompt():
     """Run search prompt inside fzf interface when available."""
@@ -379,7 +374,7 @@ def fzf_search_prompt():
         hist_titles = list(hist.keys())
         items = [f"[History] {t}" for t in hist_titles]
         
-        header = "AnimeToki CLI | Search anime or select history to resume"
+        header = build_header(['search'], "Type to search or select history")
         footer = " [ ← / ESC ] Exit  |  [ Enter ] Search / Resume \n "
         
         cmd = [
@@ -620,7 +615,9 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
     anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
     anime_urls = [urljoin(base_url, a['href']) for a in anime_list]
     
-    header = f"AnimeToki CLI | Search: '{query}'" if query else "AnimeToki CLI | Search Results"
+    path_parts = ['search', query] if query else ['search']
+    info_str = f"{len(anime_names)} {'Result' if len(anime_names) == 1 else 'Results'}"
+    header = build_header(path_parts, info_str)
     
     default_idx = None
     while True:
@@ -724,13 +721,13 @@ def anime_download_link(selected_anime_url, download_mode=False):
         link_type = classify_link(href)
         link_data.append((label, href, link_type))
 
-    keys = [(l, u) for l, u, t in link_data]
-    default_idx = get_first_unwatched_idx(keys, title_text)
-    header = f"AnimeToki CLI | {title_text}"
+    path_parts = [title_text]
+    info_str = f"{len(link_data)} {'Source' if len(link_data) == 1 else 'Sources'}"
+    header = build_header(path_parts, info_str)
+    default_idx = None
 
     while True:
-        w_set = get_watched_set(title_text)
-        labels = [format_item_label(l, t, is_watched=(l in w_set or u in w_set)) for l, u, t in link_data]
+        labels = [format_item_label(l, t) for l, u, t in link_data]
         idx = fzf_select(labels, "Select source: ", default_idx=default_idx, header=header)
         if idx is None:
             break
@@ -789,7 +786,8 @@ def fetch_content(url):
             name=x.get("name", ""),
             id=x.get("id", ""),
             mime_type=x.get("mimeType", ""),
-            node_index=initial_node_index
+            node_index=initial_node_index,
+            size=int(x.get("size", 0) or 0)
         )
         for x in initial_file_list
     ]
@@ -836,50 +834,47 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
         folder_stack = list(resume_from.get("folder_stack", []))
         current_url = resume_from.get("current_folder_url", url)
         default_highlight = resume_from.get("selected_file_name")
+        display_stack = list(resume_from.get("display_stack", []))
     else:
         folder_stack = []
         current_url = url
         default_highlight = None
+        display_stack = []
     
-    title = hist_ctx.title if hist_ctx else None
-    header = f"AnimeToki CLI | {title if title else 'Worker Folder'}"
+    if not display_stack:
+        anime_title = hist_ctx.title if hist_ctx else "Worker"
+        source_label = hist_ctx.source_label if hist_ctx else ""
+        display_stack = [anime_title, source_label]
+
     while True:
         entries = fetch_worker_folder(current_url)
         if not entries:
             while folder_stack and not entries:
                 current_url = folder_stack.pop()
+                if len(display_stack) > 2:
+                    display_stack.pop()
                 entries = fetch_worker_folder(current_url)
             if not entries:
                 logger.debug("Worker folder unreachable and stack exhausted.")
                 return False
         
-        keys = [(l, u) for l, u, t in entries]
-        preferred_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None) if default_highlight else None
+        header = build_header(display_stack, count_items_summary(entries))
+        labels = [format_item_label(l, t) for l, _, t in entries]
+        default_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None) if default_highlight else None
         default_highlight = None
-        default_idx = get_first_unwatched_idx(keys, title, preferred_idx=preferred_idx)
 
-        while True:
-            w_set = get_watched_set(title)
-            labels = [format_item_label(l, t, is_watched=(l in w_set or u in w_set)) for l, u, t in entries]
-            idx, key = fzf_select(labels, "Select: ", default_idx=default_idx, header=header, allow_toggle=True, return_key=True)
-            if idx is None:
-                if folder_stack:
-                    current_url = folder_stack.pop()
-                    break
-                return True
-            if key == "ctrl-w":
-                item_key = entries[idx][0]
-                toggle_watched(title, item_key)
-                default_idx = idx
-                continue
-            break
-
+        idx = fzf_select(labels, "Select: ", default_idx=default_idx, header=header)
         if idx is None:
-            continue
+            if folder_stack:
+                current_url = folder_stack.pop()
+                if len(display_stack) > 2:
+                    display_stack.pop()
+                continue
+            return True
 
         label, selected_url, link_type = entries[idx]
         if hist_ctx:
-            save_worker_history(hist_ctx, current_url, folder_stack, label)
+            save_worker_history(hist_ctx, current_url, folder_stack, label, display_stack=display_stack)
         
         if link_type in ('direct_video', 'unknown'):
             video_entries = [(i, l, u) for i, (l, u, t) in enumerate(entries) if t in ('direct_video', 'unknown')]
@@ -888,17 +883,15 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
             while True:
                 _, label, selected_url = video_entries[vid_idx]
                 if hist_ctx:
-                    save_worker_history(hist_ctx, current_url, folder_stack, label)
+                    save_worker_history(hist_ctx, current_url, folder_stack, label, display_stack=display_stack)
                 stream_url = resolve_stream_url(selected_url)
                 if download_mode:
                     download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
-                    mark_watched(title, label)
                     return True
-                was_watched = stream_in_mpv(stream_url, title=label)
-                if was_watched:
-                    mark_watched(title, label)
-
-                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=header)
+                
+                playing_header = build_header(display_stack + [label])
+                stream_in_mpv(stream_url, title=label)
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=playing_header)
                 if act == 0: vid_idx = min(vid_idx + 1, len(video_entries) - 1)
                 elif act == 1: pass
                 elif act == 2: vid_idx = max(vid_idx - 1, 0)
@@ -906,32 +899,24 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
                 else: return True
         elif link_type == 'worker_folder':
             folder_stack.append(current_url)
+            display_stack.append(label)
             current_url = selected_url
     return True
 
 def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=None, resume=False):
     """Play from a list of direct video episode links."""
     episodes.sort(key=lambda e: natural_sort_key(e[0]))
-    title = hist_ctx.title if hist_ctx else None
-    keys = [(e[0], e[1]) for e in episodes]
+    anime_title = hist_ctx.title if hist_ctx else "Episodes"
+    source_label = hist_ctx.source_label if hist_ctx else ""
+    path_parts = [anime_title, source_label]
+    info_str = f"{len(episodes)} {'Episode' if len(episodes) == 1 else 'Episodes'}"
+    header = build_header(path_parts, info_str)
 
     def _select_ep_prompt(cur_idx):
-        default_pos = get_first_unwatched_idx(keys, title, preferred_idx=cur_idx)
-        header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Episodes'}"
-        while True:
-            w_set = get_watched_set(title)
-            items = [format_item_label(e[0], "video", is_watched=(e[1] in w_set or e[0] in w_set)) for e in episodes]
-            res, key = fzf_select(items, "Select episode: ", default_idx=default_pos, header=header, allow_toggle=True, return_key=True)
-            if res is None:
-                return None
-            if key == "ctrl-w":
-                ep_key = episodes[res][1]
-                toggle_watched(title, ep_key)
-                default_pos = res
-                continue
-            return res
+        items = [format_item_label(e[0], "video") for e in episodes]
+        return fzf_select(items, "Select episode: ", default_idx=cur_idx, header=header)
 
-    idx = get_first_unwatched_idx(keys, title, preferred_idx=selected_idx)
+    idx = selected_idx if (selected_idx is not None and 0 <= selected_idx < len(episodes)) else 0
 
     if resume:
         res = _select_ep_prompt(idx)
@@ -939,7 +924,6 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
             return True
         idx = res
 
-    header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Episodes'}"
     while True:
         label, url = episodes[idx]
         if hist_ctx:
@@ -948,14 +932,12 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
         stream_url = resolve_stream_url(url)
         if download_mode:
             download_file(stream_url, unquote(urlparse(url).path.split('/')[-1]))
-            mark_watched(title, url)
             return True
             
-        was_watched = stream_in_mpv(stream_url, title=label)
-        if was_watched:
-            mark_watched(title, url)
+        playing_header = build_header(path_parts + [label])
+        stream_in_mpv(stream_url, title=label)
 
-        act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=header)
+        act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=playing_header)
         
         if act == 0: idx = min(idx + 1, len(episodes) - 1)
         elif act == 1: pass
@@ -971,102 +953,101 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
     def _cloud_dl_url(cf: CloudFile):
         return f"{base_cloud_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
 
-    title = hist_ctx.title if hist_ctx else None
-    header = f"AnimeToki CLI | {title if title else 'Cloud Folder'}"
-
-    def _select_cloud_file(files, default_name=None):
-        keys = [(f.name, f.id) for f in files]
-        preferred_idx = next((i for i, f in enumerate(files) if f.name == default_name), None) if default_name else None
-        default_idx = get_first_unwatched_idx(keys, title, preferred_idx=preferred_idx)
-
-        while True:
-            w_set = get_watched_set(title)
-            items = [format_cloud_file_label(f, is_watched=(f.name in w_set or f.id in w_set)) for f in files]
-            idx, key = fzf_select(items, "Select file: ", default_idx=default_idx, header=header, allow_toggle=True, return_key=True)
-            if idx is None:
-                return None
-            if key == "ctrl-w":
-                f_key = files[idx].name
-                toggle_watched(title, f_key)
-                default_idx = idx
-                continue
-            return files[idx]
-
     if resume_from:
         current_folder_url = resume_from["current_folder_url"]
         folder_stack = list(resume_from.get("folder_stack", []))
+        display_stack = list(resume_from.get("display_stack", []))
         files, _ = fetch_content(current_folder_url)
         while folder_stack and not files:
             current_folder_url = folder_stack.pop()
+            if len(display_stack) > 2:
+                display_stack.pop()
             files, _ = fetch_content(current_folder_url)
         if not files:
             logger.debug("Resume target cloud folder unreachable and stack exhausted.")
             return False
             
         last_name = resume_from.get("selected_file_name")
-        selected_file = _select_cloud_file(files, default_name=last_name)
-        if selected_file is None:
+        default_idx = next((i for i, f in enumerate(files) if f.name == last_name), None) if (files and last_name) else None
+        if not display_stack:
+            anime_title = hist_ctx.title if hist_ctx else "Cloud"
+            source_label = hist_ctx.source_label if hist_ctx else ""
+            display_stack = [anime_title, source_label]
+        header = build_header(display_stack, count_items_summary(files))
+        idx = fzf_select([format_cloud_file_label(f) for f in files], "Select file: ", default_idx=default_idx, header=header)
+        if idx is None:
             return True
+        selected_file = files[idx]
     else:
         current_folder_url = initial_link_base64
         files = current_files
         folder_stack = []
+        display_stack = []
         if files is None and current_folder_url:
             files, _ = fetch_content(current_folder_url)
 
+    if not display_stack:
+        anime_title = hist_ctx.title if hist_ctx else "Cloud"
+        source_label = hist_ctx.source_label if hist_ctx else ""
+        display_stack = [anime_title, source_label]
+
     while True:
+        header = build_header(display_stack, count_items_summary(files))
         if not selected_file:
             if not files:
                 if folder_stack:
                     current_folder_url = folder_stack.pop()
+                    if len(display_stack) > 2:
+                        display_stack.pop()
                     files, _ = fetch_content(current_folder_url)
                     continue
                 return True
 
-            selected_file = _select_cloud_file(files)
-            if selected_file is None:
+            idx = fzf_select([format_cloud_file_label(f) for f in files], "Select file: ", header=header)
+            if idx is None:
                 if folder_stack:
                     current_folder_url = folder_stack.pop()
+                    if len(display_stack) > 2:
+                        display_stack.pop()
                     files, _ = fetch_content(current_folder_url)
                     continue
                 return True
 
+            selected_file = files[idx]
+
         if hist_ctx and selected_file:
-            save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
+            save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
 
         is_video = bool(selected_file.mime_type and "video" in selected_file.mime_type.lower())
         if is_video:
             download_url = _cloud_dl_url(selected_file)
             if download_mode:
                 download_file(download_url, selected_file.name)
-                mark_watched(title, selected_file.name)
                 return True
-            was_watched = stream_in_mpv(download_url, title=selected_file.name)
-            if was_watched:
-                mark_watched(title, selected_file.name)
+            
+            playing_header = build_header(display_stack + [selected_file.name])
+            stream_in_mpv(download_url, title=selected_file.name)
             
             video_siblings = [f for f in files if f.mime_type and "video" in f.mime_type.lower()] if files else []
             vid_idx = next((j for j, f in enumerate(video_siblings) if f.name == selected_file.name), 0)
             
             while True:
-                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {selected_file.name}... ", header=header)
+                playing_header = build_header(display_stack + [selected_file.name])
+                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {selected_file.name}... ", header=playing_header)
                 if act == 0:
                     vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
                     selected_file = video_siblings[vid_idx]
                     if hist_ctx:
-                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
-                    was_w = stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
-                    if was_w: mark_watched(title, selected_file.name)
+                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
+                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
                 elif act == 1:
-                    was_w = stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
-                    if was_w: mark_watched(title, selected_file.name)
+                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
                 elif act == 2:
                     vid_idx = max(vid_idx - 1, 0)
                     selected_file = video_siblings[vid_idx]
                     if hist_ctx:
-                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type)
-                    was_w = stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
-                    if was_w: mark_watched(title, selected_file.name)
+                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
+                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
                 elif act == 3:
                     selected_file = None
                     break
@@ -1075,6 +1056,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             selected_file = None
         else:
             folder_stack.append(current_folder_url)
+            display_stack.append(selected_file.name)
             current_folder_url += base64.b64encode(unquote(selected_file.name).encode()).decode() + "/"
             files, _ = fetch_content(current_folder_url)
             selected_file = None
@@ -1089,20 +1071,14 @@ def _dispatch_result(result, download_mode):
         files, _ = fetch_content(result["url"])
         if not files:
             return
-        keys = [(f.name, f.id) for f in files]
-        default_idx = get_first_unwatched_idx(keys, title)
-        header = f"AnimeToki CLI | {hist_ctx.title if hist_ctx else 'Cloud'}"
-        while True:
-            w_set = get_watched_set(title)
-            labels = [format_cloud_file_label(f, is_watched=(f.name in w_set or f.id in w_set)) for f in files]
-            idx, key = fzf_select(labels, "Select file: ", default_idx=default_idx, header=header, allow_toggle=True, return_key=True)
-            if idx is None: return
-            if key == "ctrl-w":
-                toggle_watched(title, files[idx].name)
-                default_idx = idx
-                continue
-            play_and_browse(selected_file=files[idx], current_files=files, initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
-            break
+        anime_title = hist_ctx.title if hist_ctx else "Cloud"
+        source_label = hist_ctx.source_label if hist_ctx else ""
+        display_stack = [anime_title, source_label]
+        header = build_header(display_stack, count_items_summary(files))
+        labels = [format_cloud_file_label(f) for f in files]
+        idx = fzf_select(labels, "Select file: ", header=header)
+        if idx is None: return
+        play_and_browse(selected_file=files[idx], current_files=files, initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "direct_episodes":
         play_direct_episodes(result["episodes"], result["selected"], download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "worker_folder":
