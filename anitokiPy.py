@@ -108,6 +108,8 @@ class HistoryContext:
     source_label: str = ""
     source_type: str = ""
     source_url: str = ""
+    raw_title: str = ""
+    tags: str = ""
 
 class Spinner:
     def __init__(self, message="Fetching..."):
@@ -167,6 +169,10 @@ class Spinner:
             self.stop_event.set()
             self.thread.join()
 
+def is_raw_release_title(t: str) -> bool:
+    """Check if title string contains raw release details (resolution, dual audio, etc.)."""
+    return bool(re.search(r'\bDual Audio\b|\bSubbed\b|\b1080p\b|\b720p\b|\[.*?\]|Season \d+', str(t), re.I))
+
 def save_history_entry(title, payload):
     hist_file.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -177,19 +183,58 @@ def save_history_entry(title, payload):
         logger.debug(f"Error reading history file: {e}")
         hist = {}
     if not isinstance(hist, dict): hist = {}
+
+    target_url = payload.get("anime_url", "")
     
-    existing = hist.get(title, {})
-    if isinstance(existing, dict) and "watched" in existing and "watched" not in payload:
-        payload["watched"] = existing["watched"]
+    # Deduplicate existing keys with matching anime_url or matching key
+    existing = {}
+    keys_to_remove = []
+    for k, v in hist.items():
+        if isinstance(v, dict):
+            if (target_url and v.get("anime_url") == target_url) or k == title:
+                if not existing:
+                    existing = v
+                else:
+                    w1 = existing.get("watched", [])
+                    w2 = v.get("watched", [])
+                    existing["watched"] = list(set(w1 + w2))
+                keys_to_remove.append(k)
+
+    for k in keys_to_remove:
+        del hist[k]
+
+    if isinstance(existing, dict):
+        if "watched" in existing and "watched" not in payload:
+            payload["watched"] = existing["watched"]
+        if "raw_title" in existing and "raw_title" not in payload:
+            payload["raw_title"] = existing["raw_title"]
+
     if "watched" not in payload:
         payload["watched"] = []
 
-    hist[title] = payload
+    curr_raw = payload.get("raw_title", "")
+    prev_raw = existing.get("raw_title", "") if isinstance(existing, dict) else ""
+    
+    if is_raw_release_title(curr_raw):
+        best_raw = curr_raw
+    elif is_raw_release_title(prev_raw):
+        best_raw = prev_raw
+    elif is_raw_release_title(title):
+        best_raw = title
+    else:
+        candidates = [c for c in (curr_raw, prev_raw, title) if c]
+        best_raw = max(candidates, key=len) if candidates else title
+
+    clean_t, _, tags_str = parse_anime_title(best_raw)
+    payload["raw_title"] = best_raw
+    payload["tags"] = tags_str
+
+    hist[clean_t] = payload
     tmp_file = hist_file.with_suffix(".tmp")
     try:
         with open(tmp_file, "w") as f: json.dump(hist, f, indent=2)
         tmp_file.replace(hist_file)
-        logger.debug(f"Saved history entry for '{title}'")
+        logger.debug(f"Saved history entry for '{clean_t}'")
     except Exception as e:
         logger.error(f"Failed to save history: {e}")
 
@@ -199,8 +244,43 @@ def load_history():
     try:
         with open(hist_file, "r") as f: hist = json.load(f)
         if isinstance(hist, dict):
+            dedup = {}
+            for k, v in hist.items():
+                if not isinstance(v, dict):
+                    continue
+                url = v.get("anime_url") or k
+                curr_raw = v.get("raw_title") or k
+                
+                if url not in dedup:
+                    dedup[url] = (curr_raw, v)
+                else:
+                    prev_raw, prev_v = dedup[url]
+                    if is_raw_release_title(curr_raw) and not is_raw_release_title(prev_raw):
+                        best_raw = curr_raw
+                    elif is_raw_release_title(prev_raw) and not is_raw_release_title(curr_raw):
+                        best_raw = prev_raw
+                    else:
+                        best_raw = curr_raw if len(curr_raw) > len(prev_raw) else prev_raw
+                        
+                    t_curr = v.get("last_played", "")
+                    t_prev = prev_v.get("last_played", "")
+                    best_v = v if t_curr > t_prev else prev_v
+                    
+                    w1 = prev_v.get("watched", [])
+                    w2 = v.get("watched", [])
+                    best_v["watched"] = list(set(w1 + w2))
+                    
+                    dedup[url] = (best_raw, best_v)
+
+            cleaned_hist = {}
+            for url, (raw, v) in dedup.items():
+                clean_t, _, tags_str = parse_anime_title(raw)
+                v["raw_title"] = raw
+                v["tags"] = tags_str
+                cleaned_hist[clean_t] = v
+
             sorted_entries = sorted(
-                hist.items(),
+                cleaned_hist.items(),
                 key=lambda item: item[1].get("last_played", "") if isinstance(item[1], dict) else "",
                 reverse=True
             )
@@ -209,17 +289,25 @@ def load_history():
         logger.debug(f"Failed to load history: {e}")
     return {}
 
-def update_history(title, url):
+def update_history(title, url, raw_title=""):
+    raw = raw_title or title
+    clean_title, _, tags_str = parse_anime_title(raw)
     payload = {
         "anime_url": url,
+        "raw_title": raw,
+        "tags": tags_str,
         "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "version": 1
     }
-    save_history_entry(title, payload)
+    save_history_entry(clean_title, payload)
 
 def save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file_name, selected_file_id=None, selected_mimetype=None, display_stack=None):
+    raw = getattr(hist_ctx, "raw_title", "") or hist_ctx.title
+    tags = getattr(hist_ctx, "tags", "") or parse_anime_title(raw)[2]
     payload = {
         "anime_url": hist_ctx.anime_url,
+        "raw_title": raw,
+        "tags": tags,
         "source_label": hist_ctx.source_label,
         "source_type": "cloud",
         "source_url": hist_ctx.source_url,
@@ -235,8 +323,12 @@ def save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file
     save_history_entry(hist_ctx.title, payload)
 
 def save_direct_history(hist_ctx, episodes, selected_idx):
+    raw = getattr(hist_ctx, "raw_title", "") or hist_ctx.title
+    tags = getattr(hist_ctx, "tags", "") or parse_anime_title(raw)[2]
     payload = {
         "anime_url": hist_ctx.anime_url,
+        "raw_title": raw,
+        "tags": tags,
         "source_label": hist_ctx.source_label,
         "source_type": "direct_episodes",
         "source_url": hist_ctx.source_url,
@@ -248,8 +340,12 @@ def save_direct_history(hist_ctx, episodes, selected_idx):
     save_history_entry(hist_ctx.title, payload)
 
 def save_worker_history(hist_ctx, current_url, folder_stack, selected_name, display_stack=None):
+    raw = getattr(hist_ctx, "raw_title", "") or hist_ctx.title
+    tags = getattr(hist_ctx, "tags", "") or parse_anime_title(raw)[2]
     payload = {
         "anime_url": hist_ctx.anime_url,
+        "raw_title": raw,
+        "tags": tags,
         "source_label": hist_ctx.source_label,
         "source_type": "worker_folder",
         "source_url": hist_ctx.source_url,
@@ -284,6 +380,168 @@ def truncate_middle(text: str, max_len: int) -> str:
     remainder = max_len - 2 - half
     return text[:half] + ".." + text[-remainder:]
 
+def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
+    """
+    Parses a raw anime release title into:
+    1. clean_title: Readable display title (preserving named subtitles/spin-offs with '+ ')
+    2. path_dir: Root path folder name (/Title)
+    3. tags_str: Period-separated right-side tags (e.g. Dual.S1-S3.M.1080p)
+    """
+    working = raw_title.strip()
+    working = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', working, flags=re.IGNORECASE).strip()
+
+    # 1. Extract Resolution & Bracket Info [...]
+    brackets = re.findall(r'\[(.*?)\]', working)
+    res_tag = ''
+    for b in brackets:
+        res_matches = re.findall(r'\d{3,4}p|\b4K\b', b, re.I)
+        if res_matches:
+            if len(res_matches) > 1:
+                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
+            else:
+                res_tag = res_matches[0]
+
+    working = re.sub(r'\[.*?\]', '', working).strip()
+
+    # 2. Extract Audio, Sub & Codec Specs
+    audio_tag = ''
+    audio_patterns = [
+        (r'\bDual Audio\b|\bDual\b', 'Dual'),
+        (r'\bTri Audio\b|\bTri\b', 'Tri'),
+        (r'\bMulti Audio\b|\bMulti\b', 'Multi'),
+        (r'\bEnglish Subbed\b|\bSubbed\b', 'Sub'),
+        (r'\bEnglish Dubbed\b|\bDubbed\b', 'Dub')
+    ]
+    for pat, val in audio_patterns:
+        if re.search(pat, working, re.I):
+            audio_tag = val
+            working = re.sub(pat, '', working, flags=re.I).strip()
+            break
+
+    codec_tags = []
+    for codec in ['HEVC', 'AV1', 'BD', '10bit']:
+        if re.search(r'\b' + codec + r'\b', working, re.I):
+            codec_tags.append(codec.upper())
+            working = re.sub(r'\b' + codec + r'\b', '', working, flags=re.I).strip()
+
+    # 3. Classify Parentheses (...) Contents
+    p_match = re.search(r'\((.*?)\)', working)
+    generic_tags = []
+    named_subtitles = []
+    has_seasons = False
+
+    base_title = working
+    if p_match:
+        p_content = p_match.group(1)
+        base_title = working[:p_match.start()].strip()
+
+        items = [i.strip() for i in re.split(r'\+|\bamp\b|,', p_content)]
+
+        for item in items:
+            rem_item = item
+
+            # Season detection
+            m_s = re.search(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', rem_item, re.I)
+            if m_s:
+                has_seasons = True
+                s1 = int(m_s.group(1))
+                s2 = int(m_s.group(2)) if m_s.group(2) else None
+                generic_tags.append(f'S{s1}-S{s2}' if s2 else f'S{s1}')
+                rem_item = re.sub(r'Seasons?\s*\d+(?:\s*[-+to\s]+\s*\d+)?', '', rem_item, flags=re.I).strip()
+            elif re.search(r'All Seasons?', rem_item, re.I):
+                has_seasons = True
+                generic_tags.append('Seasons')
+                rem_item = re.sub(r'All Seasons?', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Final Season', rem_item, re.I):
+                has_seasons = True
+                generic_tags.append('Final')
+                rem_item = re.sub(r'Final Season', '', rem_item, flags=re.I).strip()
+
+            # Content Type detection
+            if re.search(r'\bMovies?\b|\bThe Movie\b', rem_item, re.I):
+                if 'M' not in generic_tags: generic_tags.append('M')
+                rem_item = re.sub(r'\bMovies?\b|\bThe Movie\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'\bOVAs?\b|\bOAV\b', rem_item, re.I):
+                if 'OVA' not in generic_tags: generic_tags.append('OVA')
+                rem_item = re.sub(r'\bOVAs?\b|\bOAV\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'\bSpecials?\b|\bShorts\b', rem_item, re.I):
+                if 'SP' not in generic_tags: generic_tags.append('SP')
+                rem_item = re.sub(r'\bSpecials?\b|\bShorts\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Complete Series|Complete Movies Series|Complete', rem_item, re.I):
+                if 'Complete' not in generic_tags: generic_tags.append('Complete')
+                rem_item = re.sub(r'Complete Series|Complete Movies Series|Complete', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Directors Cut|DC', rem_item, re.I):
+                if 'DC' not in generic_tags: generic_tags.append('DC')
+                rem_item = re.sub(r'Directors Cut|DC', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'OST', rem_item, re.I):
+                if 'OST' not in generic_tags: generic_tags.append('OST')
+                rem_item = re.sub(r'OST', '', rem_item, flags=re.I).strip()
+
+            rem_item = re.sub(r'^\W+|\W+$', '', rem_item)
+            if rem_item:
+                named_subtitles.append(rem_item)
+
+    # 4. Final Reassembly
+    base_title = re.sub(r'\bComplete Series\b|\bComplete\b', '', base_title, flags=re.I).strip()
+    base_title = re.sub(r'\s+', ' ', base_title).strip(' -:')
+
+    clean_title = base_title
+    if named_subtitles:
+        prefix = '+ ' if (has_seasons or 'Complete' in generic_tags or 'M' in generic_tags) else ''
+        clean_title += f' ({prefix}{" + ".join(named_subtitles)})'
+
+    path_dir = f'/{base_title}'
+
+    all_tags = []
+    if audio_tag: all_tags.append(audio_tag)
+    for gt in generic_tags:
+        if gt not in all_tags: all_tags.append(gt)
+    for ct in codec_tags:
+        if ct not in all_tags: all_tags.append(ct)
+    if res_tag: all_tags.append(res_tag)
+
+    tags_str = '.'.join(all_tags)
+
+    return clean_title, path_dir, tags_str
+
+def format_anime_title_label(raw_title: str) -> str:
+    """Formats an anime title with clean display title on left and right-aligned tags in gray."""
+    clean_title, path_dir, tags_str = parse_anime_title(raw_title)
+    if not tags_str:
+        return clean_title
+    cols, _ = shutil.get_terminal_size((80, 24))
+    avail_width = max(30, cols - 8)
+    pad_count = max(2, avail_width - len(clean_title) - len(tags_str))
+    spaces = " " * pad_count
+    return f"{clean_title}{spaces}\033[90m{tags_str}\033[0m"
+
+def format_history_label(title: str, entry: dict = None) -> str:
+    """Formats a watch history entry with '[History]' prefix, clean display title on left, and right-aligned tags in gray."""
+    raw = ""
+    saved_tags = ""
+    if isinstance(entry, dict):
+        raw = entry.get("raw_title", "")
+        saved_tags = entry.get("tags", "")
+
+    clean_title, _, tags_str = parse_anime_title(raw if raw else title)
+    final_tags = saved_tags or tags_str
+
+    cols, _ = shutil.get_terminal_size((80, 24))
+    avail_width = max(30, cols - 8)
+    left_ansi = f"\033[1;36m[History]\033[0m {clean_title}"
+    left_plain = f"[History] {clean_title}"
+    if final_tags:
+        pad_count = max(2, avail_width - len(left_plain) - len(final_tags))
+        spaces = " " * pad_count
+        return f"{left_ansi}{spaces}\033[90m{final_tags}\033[0m"
+    return left_ansi
+
 def build_header(path_parts: list, items_info: str = "") -> str:
     """Build a clean header with dynamic breadcrumb path truncated to fit terminal width."""
     cols, _ = shutil.get_terminal_size((80, 24))
@@ -291,8 +549,10 @@ def build_header(path_parts: list, items_info: str = "") -> str:
     for p in path_parts:
         if p:
             s = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', str(p), flags=re.IGNORECASE).strip('/')
-            if s:
-                clean_parts.append(s)
+            _, path_dir, _ = parse_anime_title(s)
+            s_clean = path_dir.strip('/') if path_dir != '/' else s
+            if s_clean:
+                clean_parts.append(s_clean)
     
     info_plain = f"  ({items_info})" if items_info else ""
     max_path_len = max(15, cols - len(info_plain) - 6)
@@ -352,33 +612,58 @@ def count_items_summary(items_or_files):
     return ", ".join(parts)
 
 def format_item_label(name: str, item_type: str, size_str: str = "") -> str:
-    """Format label with type icon, right-aligned file size (no brackets), and ANSI colors."""
-    name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE)
+    """Format label with type icon, clean name (no extensions/res brackets), right-aligned resolution tag & file size, and ANSI colors."""
+    is_folder = item_type in ('folder', 'worker_folder', 'cloud')
+    clean_name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE).strip()
+
+    res_tag = ''
+    if not is_folder:
+        clean_name = re.sub(r'\.(?:mkv|mp4|avi|webm)$', '', clean_name, flags=re.IGNORECASE).strip()
+
+        # Extract resolution tag (1080p, 720p, 480p, 4K) for files only
+        res_matches = re.findall(r'\b\d{3,4}p\b|\b4K\b', clean_name, flags=re.IGNORECASE)
+        if res_matches:
+            if len(res_matches) > 1:
+                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
+            else:
+                res_tag = res_matches[0]
+                
+            clean_name = re.sub(r'\[\s*(?:\d{3,4}p|4K)(?:-\d{3,4}p)?\s*\]', '', clean_name, flags=re.IGNORECASE)
+            clean_name = re.sub(r'\b(?:\d{3,4}p|4K)\b', '', clean_name, flags=re.IGNORECASE)
+
+        clean_name = re.sub(r'\[\s*\]', '', clean_name)
+        clean_name = re.sub(r'\s+', ' ', clean_name).strip(' .-_')
+
+    # Construct right-side string (resolution tag BEFORE file size, for files only)
+    right_parts = []
+    if res_tag and not is_folder:
+        right_parts.append(res_tag)
+    if size_str:
+        plain_size = size_str.strip('()')
+        if plain_size:
+            right_parts.append(plain_size)
+
+    right_str = '  '.join(right_parts)
+
     cols, _ = shutil.get_terminal_size((80, 24))
     avail_width = max(30, cols - 8)
 
-    if size_str:
-        plain_size = size_str.strip('()')
-        if item_type in ('folder', 'worker_folder', 'cloud'):
-            left_plain = f"🗁  {name}"
-            left_ansi = f"\033[1;38;5;215m🗁  {name}\033[0m"
-        elif item_type in ('video', 'direct_video', 'file'):
-            left_plain = f"▶  {name}"
-            left_ansi = f"\033[1;37m▶  {name}\033[0m"
-        else:
-            left_plain = f"   {name}"
-            left_ansi = f"\033[0m   {name}"
-
-        pad_count = max(2, avail_width - len(left_plain) - len(plain_size))
-        spaces = " " * pad_count
-        return f"{left_ansi}{spaces}\033[90m{plain_size}\033[0m"
+    if is_folder:
+        left_plain = f"🗁  {clean_name}"
+        left_ansi = f"\033[1;38;5;215m🗁  {clean_name}\033[0m"
+    elif item_type in ('video', 'direct_video', 'file'):
+        left_plain = f"▶  {clean_name}"
+        left_ansi = f"\033[1;37m▶  {clean_name}\033[0m"
     else:
-        if item_type in ('folder', 'worker_folder', 'cloud'):
-            return f"\033[1;38;5;215m🗁  {name}\033[0m"
-        elif item_type in ('video', 'direct_video', 'file'):
-            return f"\033[1;37m▶  {name}\033[0m"
-        else:
-            return f"\033[0m   {name}"
+        left_plain = f"   {clean_name}"
+        left_ansi = f"\033[0m   {clean_name}"
+
+    if right_str:
+        pad_count = max(2, avail_width - len(left_plain) - len(right_str))
+        spaces = " " * pad_count
+        return f"{left_ansi}{spaces}\033[90m{right_str}\033[0m"
+    else:
+        return left_ansi
 
 def format_cloud_file_label(cf: CloudFile) -> str:
     """Format CloudFile with type icon, file size, and ANSI colors."""
@@ -471,13 +756,22 @@ def fzf_search_prompt():
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         hist = load_history()
         hist_titles = list(hist.keys())
-        items = [f"[History] {t}" for t in hist_titles]
+        hist_map = {}
+        items = []
+        for t in hist_titles:
+            entry = hist.get(t)
+            lbl = format_history_label(t, entry)
+            items.append(lbl)
+            hist_map[lbl] = t
+            plain_lbl = re.sub(r'\033\[[0-9;]*m', '', lbl)
+            hist_map[plain_lbl] = t
         
         header = build_header(['search'])
         footer = build_footer([("Enter", "Search / Resume"), ("ESC / ←", "Exit")])
         
         cmd = [
             "fzf",
+            "--ansi",
             "--border=rounded",
             "--border-label= AnimeToki CLI ",
             "--info=inline: ",
@@ -512,10 +806,13 @@ def fzf_search_prompt():
                     return ("exit", None)
                 return ("search", typed_query)
                 
-            if selected_item and selected_item.startswith("[History] "):
-                title = selected_item[len("[History] "):].strip()
-                if title in hist:
-                    return ("history", (title, hist[title]))
+            if selected_item:
+                plain_sel = re.sub(r'\033\[[0-9;]*m', '', selected_item)
+                real_title = hist_map.get(selected_item) or hist_map.get(plain_sel)
+                if not real_title and selected_item.startswith("[History] "):
+                    real_title = selected_item[len("[History] "):].strip()
+                if real_title and real_title in hist:
+                    return ("history", (real_title, hist[real_title]))
                     
         return ("exit", None)
     
@@ -716,16 +1013,17 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
         print("No results found.")
         return
 
-    anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
+    raw_anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
+    display_names = [format_anime_title_label(n) for n in raw_anime_names]
     anime_urls = [urljoin(base_url, a['href']) for a in anime_list]
     
     path_parts = ['search', query] if query else ['search']
-    info_str = f"{len(anime_names)} {'Result' if len(anime_names) == 1 else 'Results'}"
+    info_str = f"{len(raw_anime_names)} {'Result' if len(raw_anime_names) == 1 else 'Results'}"
     header = build_header(path_parts, info_str)
     
     default_idx = None
     while True:
-        idx = fzf_select(anime_names, "Select anime: ", default_idx=default_idx, header=header)
+        idx = fzf_select(display_names, "Select anime: ", default_idx=default_idx, header=header)
         if idx is None:
             break
         default_idx = idx
@@ -801,8 +1099,9 @@ def anime_download_link(selected_anime_url, download_mode=False):
     soup_anime_list = BeautifulSoup(res_anime.content, 'html.parser')
 
     anime_title = soup_anime_list.find('h1', class_="post-title entry-title")
-    title_text = anime_title.get_text().strip() if anime_title else "Unknown"
-    update_history(title_text, selected_anime_url)
+    raw_title_text = anime_title.get_text().strip() if anime_title else "Unknown"
+    clean_title, path_dir, _ = parse_anime_title(raw_title_text)
+    update_history(clean_title, selected_anime_url)
 
     # Find cloud links (completed anime)
     cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
@@ -825,7 +1124,7 @@ def anime_download_link(selected_anime_url, download_mode=False):
         link_type = classify_link(href)
         link_data.append((label, href, link_type))
 
-    path_parts = [title_text]
+    path_parts = [raw_title_text]
     info_str = f"{len(link_data)} {'Source' if len(link_data) == 1 else 'Sources'}"
     header = build_header(path_parts, info_str)
     default_idx = None
@@ -840,7 +1139,7 @@ def anime_download_link(selected_anime_url, download_mode=False):
         label, selected_url, link_type = link_data[idx]
         stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
         hist_ctx = HistoryContext(
-            title=title_text,
+            title=clean_title,
             anime_url=selected_anime_url,
             source_label=label,
             source_type=stype,
@@ -1293,7 +1592,8 @@ def main():
                     return
                 else:
                     titles = list(hist.keys())
-                    idx = fzf_select(titles, "Select history: ", header="AnimeToki CLI | Watch History")
+                    display_titles = [format_history_label(t, hist.get(t)) for t in titles]
+                    idx = fzf_select(display_titles, "Select history: ", header="AnimeToki CLI | Watch History")
                     if idx is not None:
                         selected_title = titles[idx]
                         entry = hist[selected_title]
