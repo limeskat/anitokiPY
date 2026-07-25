@@ -1,42 +1,32 @@
 # AnitokiPy
 
-### Running [animetoki.com](https://animetoki.com/) in a cli interface.
+CLI for [animetoki.com](https://animetoki.com/). Stream or download anime from terminal.
 
----
+## Dependencies
 
-### Dependencies
+- **`mpv`**: Video playback
+- **`fzf`**: Interactive selection (optional)
+- **`curl`**: File downloads
 
-- **`mpv`**: Required for streaming video (automatically saves and resumes play position).
-- **`fzf`**: Recommended for interactive fuzzy selection (gracefully falls back to numbered menus in non-interactive/piped sessions or if `fzf` is uninstalled).
-- **`curl`**: Used for downloading videos with progress output.
-
-### Setup
+## Installation & Usage
 
 ```bash
 pip install -e .
+
+anitokipy               # Interactive CLI
+anitokipy "anime title" # Direct search
 ```
 
-### Usage
+## Options
 
-Start the interactive CLI:
-```bash
-anitokipy
-```
-Or search directly from the command line:
-```bash
-anitokipy "anime name"
-```
+- `-c, --continue-watch`: Resume last viewed anime
+- `-d, --download`: Download video instead of streaming
+- `-C, --clear-history`: Clear watch history
+- `-v, --verbose`: Verbose debug logging
 
-### Flags
+## Config File
 
-- `-c, --continue-watch`: Open your watch history and jump straight back into the last anime you viewed (exits with a clean message if history is empty).
-- `-C, --clear-history`: Delete your watch history file.
-- `-d, --download`: Download the video file (to `download_dir` or current directory) with a progress bar instead of streaming.
-- `-v, --verbose`: Show debug log output in the terminal.
-
-### Configuration
-
-You can customize `anitokipy` by creating a JSON configuration file at `~/.config/anitokipy/config.json`:
+`~/.config/anitokipy/config.json`:
 
 ```json
 {
@@ -50,19 +40,3 @@ You can customize `anitokipy` by creating a JSON configuration file at `~/.confi
   "download_dir": "."
 }
 ```
-
-#### Config Keys:
-- **`user_agent`**: Custom HTTP User-Agent string for network requests and streaming.
-- **`mpv_flags`**: List of command-line flags passed to `mpv` when streaming (`--save-position-on-quit` is enabled by default to preserve playback timestamps).
-- **`download_dir`**: Directory where downloaded files are saved when using `-d` / `--download`.
-
-### Features & Navigation
-- **Unified FZF Interface**: The main search prompt runs directly inside `fzf` with recent watch history pre-loaded, eliminating terminal context switching. Type a query to search or select a history item to resume immediately.
-- **Top Status Headers**: Every menu displays a clean status/context header at the top of `fzf`.
-- **Loading Spinner**: Interactive terminal spinner provides visual feedback during network requests.
-- **Arrow Key Navigation**:
-  - **`[← Left]`**: Go back to parent folder or previous menu.
-  - **`[→ Right / Enter]`**: Select item or open subfolder.
-  Keybindings are prominently displayed in the menu footer at the bottom of the terminal screen.
-- **Post-Play Controls**: After an episode finishes (or `mpv` is closed), options appear to play `next`, `replay`, `previous`, `select` a file, or `quit`.
-- **Exit**: Type `exit` in the search prompt or press `Ctrl+D` / `Ctrl+C` / `[← Left]` to cleanly exit.
