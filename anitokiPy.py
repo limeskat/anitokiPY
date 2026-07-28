@@ -11,14 +11,34 @@ import argparse
 import signal
 import threading
 import shlex
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
 
 try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
     import termios
 except ImportError:
     termios = None
+
+# Set up logging early so all components can log warnings/errors
+log_dir = Path.home() / ".local" / "share" / "anitokipy"
+try:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=str(log_dir / "anitokipy.log"),
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+except Exception:
+    logging.basicConfig(level=logging.ERROR)
+
+logger = logging.getLogger("anitokipy")
 
 base_url = "https://animetoki.com"
 search_url = "https://animetoki.com/?s="
@@ -28,6 +48,55 @@ COOKIE_PATH = Path.home() / ".local" / "state" / "anitokipy" / "cookies.json"
 CACHE_FILE = Path.home() / ".local" / "state" / "anitokipy" / "cache.json"
 
 session = None
+
+# --- Pre-compiled Regular Expressions for Performance ---
+RE_RELEASE_PREFIX = re.compile(r'\[(?:AnimeSakura|AnimeToki)\]\s*', re.IGNORECASE)
+RE_BRACKETS = re.compile(r'\[(.*?)\]')
+RE_RESOLUTION = re.compile(r'\d{3,4}p|\b4K\b', re.IGNORECASE)
+RE_DIGITS_ONLY = re.compile(r'\D')
+RE_PAREN_CONTENT = re.compile(r'\((.*?)\)')
+RE_SEASONS = re.compile(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', re.IGNORECASE)
+RE_ALL_SEASONS = re.compile(r'All Seasons?', re.IGNORECASE)
+RE_FINAL_SEASON = re.compile(r'Final Season', re.IGNORECASE)
+RE_MOVIES = re.compile(r'\bMovies?\b|\bThe Movie\b', re.IGNORECASE)
+RE_OVAS = re.compile(r'\bOVAs?\b|\bOAV\b', re.IGNORECASE)
+RE_SPECIALS = re.compile(r'\bSpecials?\b|\bShorts\b', re.IGNORECASE)
+RE_COMPLETE = re.compile(r'Complete Series|Complete Movies Series|Complete', re.IGNORECASE)
+RE_DIRECTORS_CUT = re.compile(r'Directors Cut|DC', re.IGNORECASE)
+RE_OST = re.compile(r'OST', re.IGNORECASE)
+RE_TRIM_PUNCT = re.compile(r'^\W+|\W+$')
+RE_NATURAL_SORT_NORM = re.compile(r'[^\w\s]')
+RE_WHITESPACE = re.compile(r'\s+')
+RE_DIGIT_SPLIT = re.compile(r'([0-9]+)')
+RE_RAW_RELEASE = re.compile(r'\bDual Audio\b|\bSubbed\b|\b1080p\b|\b720p\b|\[.*?\]|Season \d+', re.IGNORECASE)
+RE_BASE64_INVALID = re.compile(r"[%\s\[\]\(\)\\]")
+RE_BASE64_FULL = re.compile(r"[A-Za-z0-9+/=_~-]+")
+RE_VIDEO_EXT = re.compile(r'\.(?:mkv|mp4|avi|webm)$', re.IGNORECASE)
+RE_TAG_WORDS = re.compile(
+    r'HEVC|HVEC|x265|x264|AVC|10bit|8bit|Dual[- ]Audio|Tri[- ]Audio|Multi[- ]Audio|'
+    r'Multi[- ]Subs?|Eng[- ]Subs?|Softsubs?|Hardsubs?|Subbed|Dubbed|BD|BDRip|WEBRip|WEB-DL|AAC|OPUS|FLAC|AC3',
+    re.IGNORECASE
+)
+RE_ANSI_ESCAPE = re.compile(r'\033\[[0-9;]*m')
+RE_CODEC_HEVC = re.compile(r'\bHEVC\b', re.IGNORECASE)
+RE_CODEC_AV1 = re.compile(r'\bAV1\b', re.IGNORECASE)
+RE_CODEC_BD = re.compile(r'\bBD\b', re.IGNORECASE)
+RE_CODEC_10BIT = re.compile(r'\b10bit\b', re.IGNORECASE)
+
+AUDIO_PATTERNS = [
+    (re.compile(r'\bDual Audio\b|\bDual\b', re.IGNORECASE), 'Dual'),
+    (re.compile(r'\bTri Audio\b|\bTri\b', re.IGNORECASE), 'Tri'),
+    (re.compile(r'\bMulti Audio\b|\bMulti\b', re.IGNORECASE), 'Multi'),
+    (re.compile(r'\bEnglish Subbed\b|\bSubbed\b', re.IGNORECASE), 'Sub'),
+    (re.compile(r'\bEnglish Dubbed\b|\bDubbed\b', re.IGNORECASE), 'Dub')
+]
+
+CODEC_PATTERNS = [
+    ('HEVC', RE_CODEC_HEVC),
+    ('AV1', RE_CODEC_AV1),
+    ('BD', RE_CODEC_BD),
+    ('10bit', RE_CODEC_10BIT)
+]
 
 @dataclass
 class CloudFile:
@@ -47,38 +116,268 @@ class HistoryContext:
     raw_title: str = ""
     tags: str = ""
 
+# --- Thread-Safe & Atomic In-Memory Storage Classes ---
+class FetchCacheStore:
+    def __init__(self, file_path: Path):
+        self.file_path = file_path
+        self._cache: dict | None = None
+        self._lock = threading.Lock()
+
+    def get(self, key: str, ttl: int = 300):
+        with self._lock:
+            if self._cache is None:
+                self._cache = self._load()
+            entry = self._cache.get(key)
+            if isinstance(entry, dict) and "time" in entry and "data" in entry:
+                if time.time() - entry["time"] < ttl:
+                    return entry["data"]
+            return None
+
+    def set(self, key: str, data) -> None:
+        with self._lock:
+            if self._cache is None:
+                self._cache = self._load()
+            self._cache[key] = {"time": time.time(), "data": data}
+            self._save(self._cache)
+
+    def _load(self) -> dict:
+        if not self.file_path.exists():
+            return {}
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to read fetch cache from {self.file_path}: {e}")
+            return {}
+
+    def _save(self, data: dict) -> None:
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.file_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(self.file_path)
+        except OSError as e:
+            logger.error(f"Failed to save fetch cache to {self.file_path}: {e}")
+
+fetch_cache_store = FetchCacheStore(CACHE_FILE)
+
 def load_fetch_cache():
-    if not CACHE_FILE.exists():
-        return {}
-    try:
-        with open(CACHE_FILE, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return fetch_cache_store._load()
 
 def save_fetch_cache(cache):
-    try:
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_FILE.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(cache, f)
-        tmp.replace(CACHE_FILE)
-    except Exception:
-        pass
+    fetch_cache_store._save(cache)
 
 def get_cached_fetch(key, ttl=300):
-    cache = load_fetch_cache()
-    entry = cache.get(key)
-    if isinstance(entry, dict) and "time" in entry and "data" in entry:
-        if time.time() - entry["time"] < ttl:
-            return entry["data"]
-    return None
+    return fetch_cache_store.get(key, ttl=ttl)
 
 def set_cached_fetch(key, data):
-    cache = load_fetch_cache()
-    cache[key] = {"time": time.time(), "data": data}
-    save_fetch_cache(cache)
+    fetch_cache_store.set(key, data)
+
+class HistoryStore:
+    def __init__(self, file_path: Path):
+        self.file_path = file_path
+        self._cache: dict | None = None
+        self._lock = threading.Lock()
+
+    def get_all(self, force_reload: bool = False) -> dict:
+        with self._lock:
+            if self._cache is not None and not force_reload:
+                return self._cache
+            self._cache = self._load_from_disk()
+            return self._cache
+
+    def _load_from_disk(self) -> dict:
+        if not self.file_path.exists():
+            return {}
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                if fcntl:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    except OSError:
+                        pass
+                hist = json.load(f)
+                if isinstance(hist, dict):
+                    return self._clean_and_dedup(hist)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to load history from {self.file_path}: {e}")
+        return {}
+
+    def _clean_and_dedup(self, hist: dict) -> dict:
+        dedup = {}
+        for k, v in hist.items():
+            if not isinstance(v, dict):
+                continue
+            url = v.get("anime_url") or k
+            curr_raw = v.get("raw_title") or k
+            
+            if url not in dedup:
+                dedup[url] = (curr_raw, v)
+            else:
+                prev_raw, prev_v = dedup[url]
+                if is_raw_release_title(curr_raw) and not is_raw_release_title(prev_raw):
+                    best_raw = curr_raw
+                elif is_raw_release_title(prev_raw) and not is_raw_release_title(curr_raw):
+                    best_raw = prev_raw
+                else:
+                    best_raw = curr_raw if len(curr_raw) > len(prev_raw) else prev_raw
+                    
+                t_curr = v.get("last_played", "")
+                t_prev = prev_v.get("last_played", "")
+                best_v = v if t_curr > t_prev else prev_v
+                
+                w1 = prev_v.get("watched", [])
+                w2 = v.get("watched", [])
+                best_v["watched"] = list(set(w1 + w2))
+                
+                dedup[url] = (best_raw, best_v)
+
+        cleaned_hist = {}
+        for url, (raw, v) in dedup.items():
+            clean_t, _, tags_str = parse_anime_title(raw)
+            if not tags_str and isinstance(v, dict):
+                tags_str = v.get("tags", "")
+            if not tags_str and isinstance(v, dict):
+                cands = [v.get("selected_file_name"), v.get("source_label")]
+                for ep in v.get("episodes", []):
+                    if isinstance(ep, (list, tuple)) and len(ep) > 0: cands.append(ep[0])
+                for cand in cands:
+                    if cand:
+                        _, _, t_str = parse_anime_title(cand)
+                        if t_str:
+                            tags_str = t_str
+                            break
+            v["raw_title"] = raw
+            v["tags"] = tags_str
+            
+            if clean_t in cleaned_hist:
+                existing_v = cleaned_hist[clean_t]
+                w1 = existing_v.get("watched", [])
+                w2 = v.get("watched", [])
+                v["watched"] = list(set(w1 + w2))
+
+            cleaned_hist[clean_t] = v
+
+        sorted_entries = sorted(
+            cleaned_hist.items(),
+            key=lambda item: item[1].get("last_played", "") if isinstance(item[1], dict) else "",
+            reverse=True
+        )
+        return dict(sorted_entries)
+
+    def save_entry(self, title: str, payload: dict) -> None:
+        with self._lock:
+            hist = self._cache if self._cache is not None else self._load_from_disk()
+            target_url = payload.get("anime_url", "")
+            clean_target = parse_anime_title(title)[0]
+            
+            existing = {}
+            existing_watched = []
+            keys_to_remove = []
+            
+            for k, v in hist.items():
+                if isinstance(v, dict):
+                    k_clean = parse_anime_title(k)[0]
+                    v_url = v.get("anime_url", "")
+                    if (target_url and v_url == target_url) or k == title or k_clean == clean_target:
+                        if not existing:
+                            existing = v
+                        if "watched" in v and isinstance(v["watched"], list):
+                            existing_watched.extend(v["watched"])
+                        if "raw_title" in v and "raw_title" not in payload:
+                            payload["raw_title"] = v["raw_title"]
+                        keys_to_remove.append(k)
+
+            for k in keys_to_remove:
+                del hist[k]
+
+            if "watched" in payload and isinstance(payload["watched"], list):
+                payload["watched"] = list(set(payload["watched"]))
+            else:
+                payload["watched"] = list(set(existing_watched))
+
+            curr_raw = payload.get("raw_title", "")
+            prev_raw = existing.get("raw_title", "") if isinstance(existing, dict) else ""
+            
+            candidates_raw = [curr_raw, prev_raw, title]
+            if payload.get("selected_file_name"):
+                candidates_raw.append(payload["selected_file_name"])
+            if payload.get("source_label"):
+                candidates_raw.append(payload["source_label"])
+            for ep in payload.get("episodes", []):
+                if isinstance(ep, (list, tuple)) and len(ep) > 0:
+                    candidates_raw.append(ep[0])
+                elif isinstance(ep, str):
+                    candidates_raw.append(ep)
+
+            raw_matches = [c for c in candidates_raw if c and is_raw_release_title(c)]
+            if raw_matches:
+                best_raw = raw_matches[0]
+            else:
+                valid_cands = [c for c in (curr_raw, prev_raw, title) if c]
+                best_raw = max(valid_cands, key=len) if valid_cands else title
+
+            clean_t, _, tags_str = parse_anime_title(best_raw)
+            
+            if not tags_str:
+                for cand in candidates_raw:
+                    if cand:
+                        _, _, t_str = parse_anime_title(cand)
+                        if t_str:
+                            tags_str = t_str
+                            break
+
+            payload["raw_title"] = best_raw
+            payload["tags"] = tags_str
+
+            hist[clean_t] = payload
+            self._cache = hist
+            self._flush_to_disk(hist)
+
+    def delete_entry(self, title: str) -> bool:
+        with self._lock:
+            hist = self._cache if self._cache is not None else self._load_from_disk()
+            clean_target = parse_anime_title(title)[0]
+            keys_to_delete = [k for k in hist.keys() if k == title or parse_anime_title(k)[0] == clean_target]
+            if keys_to_delete:
+                for k in keys_to_delete:
+                    del hist[k]
+                self._cache = hist
+                self._flush_to_disk(hist)
+                return True
+            return False
+
+    def _flush_to_disk(self, hist: dict) -> None:
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.file_path.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                if fcntl:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    except OSError:
+                        pass
+                json.dump(hist, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.replace(self.file_path)
+        except OSError as e:
+            logger.error(f"Failed writing history to {self.file_path}: {e}")
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache = {}
+            try:
+                self.file_path.unlink(missing_ok=True)
+            except (OSError, TypeError):
+                if self.file_path.exists():
+                    self.file_path.unlink()
+
+history_store = HistoryStore(hist_file)
 
 def save_cookies():
     if not session or not hasattr(session, "cookies"):
@@ -95,17 +394,23 @@ def save_cookies():
                 "path": getattr(c, "path", "/")
             })
         tmp_file = COOKIE_PATH.with_suffix(".tmp")
-        with open(tmp_file, "w") as f:
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(cookies_data, f)
+            f.flush()
+            os.fsync(f.fileno())
         tmp_file.replace(COOKIE_PATH)
-    except Exception:
-        pass
+        try:
+            COOKIE_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        logger.error(f"Failed to save cookies: {e}")
 
 def load_cookies():
     if not session or not COOKIE_PATH.exists():
         return
     try:
-        with open(COOKIE_PATH, "r") as f:
+        with open(COOKIE_PATH, "r", encoding="utf-8") as f:
             cookies_data = json.load(f)
         if isinstance(cookies_data, list):
             for c in cookies_data:
@@ -114,8 +419,8 @@ def load_cookies():
                     if c.get("domain"): kwargs["domain"] = c["domain"]
                     if c.get("path"): kwargs["path"] = c["path"]
                     session.cookies.set(c["name"], c["value"], **kwargs)
-    except Exception:
-        pass
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load cookies from {COOKIE_PATH}: {e}")
 
 def _cookie_header():
     if not session or not hasattr(session, "cookies"):
@@ -124,7 +429,8 @@ def _cookie_header():
         jar = getattr(session.cookies, "jar", session.cookies)
         cookies_dict = {c.name: c.value for c in jar}
         return "; ".join(f"{name}={value}" for name, value in cookies_dict.items())
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Failed generating cookie header: {e}")
         return ""
 
 def init_session(force_refresh=False):
@@ -135,13 +441,12 @@ def init_session(force_refresh=False):
     session = cffi_requests.Session(impersonate="firefox133")
     if not force_refresh:
         load_cookies()
-    try:
-        session.get("https://animetoki.com", timeout=4)
-        session.get("https://cloud.animetoki.com", timeout=4)
-        session.get("https://drive.animetoki.com", timeout=4)
-        save_cookies()
-    except Exception:
-        pass
+    for endpoint in ("https://animetoki.com", "https://cloud.animetoki.com", "https://drive.animetoki.com"):
+        try:
+            session.get(endpoint, timeout=4)
+        except Exception as e:
+            logger.debug(f"Session ping to {endpoint} failed: {e}")
+    save_cookies()
 
 def safe_request(method, url, max_retries=3, timeout=4, **kwargs):
     global session
@@ -157,7 +462,7 @@ def safe_request(method, url, max_retries=3, timeout=4, **kwargs):
             save_cookies()
             return resp
         except Exception as e:
-            if 'logger' in globals() and logger and logger.handlers:
+            if logger and logger.handlers:
                 logger.debug(f"Request failed ({method} {url}, attempt {attempt+1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
                 return None
@@ -167,9 +472,9 @@ def safe_request(method, url, max_retries=3, timeout=4, **kwargs):
 def is_base64_segment(s: str) -> bool:
     if not s:
         return False
-    if re.search(r"[%\s\[\]\(\)\\]", s):
+    if RE_BASE64_INVALID.search(s):
         return False
-    if not re.fullmatch(r"[A-Za-z0-9+/=_~-]+", s):
+    if not RE_BASE64_FULL.fullmatch(s):
         return False
     try:
         padded = s + "=" * (-len(s) % 4)
@@ -199,50 +504,43 @@ def encode_cloud_url(url: str) -> str:
     return domain_url + "/".join(segments) + "/" if segments else domain_url
 
 def natural_sort_key(s):
-    s_norm = re.sub(r'[^\w\s]', ' ', s.lower())
-    s_norm = re.sub(r'\s+', ' ', s_norm).strip()
-    return [int(text) if text.isdigit() else text for text in re.split('([0-9]+)', s_norm)]
+    s_norm = RE_NATURAL_SORT_NORM.sub(' ', s.lower())
+    s_norm = RE_WHITESPACE.sub(' ', s_norm).strip()
+    return [int(text) if text.isdigit() else text for text in RE_DIGIT_SPLIT.split(s_norm)]
 
 def is_raw_release_title(t: str) -> bool:
-    return bool(re.search(r'\bDual Audio\b|\bSubbed\b|\b1080p\b|\b720p\b|\[.*?\]|Season \d+', str(t), re.I))
+    return bool(RE_RAW_RELEASE.search(str(t)))
 
 def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
     working = str(raw_title).strip()
-    working = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', working, flags=re.IGNORECASE).strip()
+    working = RE_RELEASE_PREFIX.sub('', working).strip()
 
-    brackets = re.findall(r'\[(.*?)\]', working)
+    brackets = RE_BRACKETS.findall(working)
     res_tag = ''
     for b in brackets:
-        res_matches = re.findall(r'\d{3,4}p|\b4K\b', b, re.I)
+        res_matches = RE_RESOLUTION.findall(b)
         if res_matches:
             if len(res_matches) > 1:
-                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
+                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(RE_DIGITS_ONLY.sub('', x)) if RE_DIGITS_ONLY.sub('', x) else 0, reverse=True))
             else:
                 res_tag = res_matches[0]
 
-    working = re.sub(r'\[.*?\]', '', working).strip()
+    working = RE_BRACKETS.sub('', working).strip()
 
     audio_tag = ''
-    audio_patterns = [
-        (r'\bDual Audio\b|\bDual\b', 'Dual'),
-        (r'\bTri Audio\b|\bTri\b', 'Tri'),
-        (r'\bMulti Audio\b|\bMulti\b', 'Multi'),
-        (r'\bEnglish Subbed\b|\bSubbed\b', 'Sub'),
-        (r'\bEnglish Dubbed\b|\bDubbed\b', 'Dub')
-    ]
-    for pat, val in audio_patterns:
-        if re.search(pat, working, re.I):
+    for pat, val in AUDIO_PATTERNS:
+        if pat.search(working):
             audio_tag = val
-            working = re.sub(pat, '', working, flags=re.I).strip()
+            working = pat.sub('', working).strip()
             break
 
     codec_tags = []
-    for codec in ['HEVC', 'AV1', 'BD', '10bit']:
-        if re.search(r'\b' + codec + r'\b', working, re.I):
-            codec_tags.append(codec.upper())
-            working = re.sub(r'\b' + codec + r'\b', '', working, flags=re.I).strip()
+    for codec, pat in CODEC_PATTERNS:
+        if pat.search(working):
+            codec_tags.append(codec)
+            working = pat.sub('', working).strip()
 
-    p_match = re.search(r'\((.*?)\)', working)
+    p_match = RE_PAREN_CONTENT.search(working)
     generic_tags = []
     named_subtitles = []
     has_seasons = False
@@ -257,53 +555,53 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
         for item in items:
             rem_item = item
 
-            m_s = re.search(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', rem_item, re.I)
+            m_s = RE_SEASONS.search(rem_item)
             if m_s:
                 has_seasons = True
                 s1 = int(m_s.group(1))
                 s2 = int(m_s.group(2)) if m_s.group(2) else None
                 generic_tags.append(f'S{s1}-S{s2}' if s2 else f'S{s1}')
-                rem_item = re.sub(r'Seasons?\s*\d+(?:\s*[-+to\s]+\s*\d+)?', '', rem_item, flags=re.I).strip()
-            elif re.search(r'All Seasons?', rem_item, re.I):
+                rem_item = RE_SEASONS.sub('', rem_item).strip()
+            elif RE_ALL_SEASONS.search(rem_item):
                 has_seasons = True
                 generic_tags.append('Seasons')
-                rem_item = re.sub(r'All Seasons?', '', rem_item, flags=re.I).strip()
+                rem_item = RE_ALL_SEASONS.sub('', rem_item).strip()
 
-            if re.search(r'Final Season', rem_item, re.I):
+            if RE_FINAL_SEASON.search(rem_item):
                 has_seasons = True
                 generic_tags.append('Final')
-                rem_item = re.sub(r'Final Season', '', rem_item, flags=re.I).strip()
+                rem_item = RE_FINAL_SEASON.sub('', rem_item).strip()
 
-            if re.search(r'\bMovies?\b|\bThe Movie\b', rem_item, re.I):
+            if RE_MOVIES.search(rem_item):
                 if 'M' not in generic_tags: generic_tags.append('M')
-                rem_item = re.sub(r'\bMovies?\b|\bThe Movie\b', '', rem_item, flags=re.I).strip()
+                rem_item = RE_MOVIES.sub('', rem_item).strip()
 
-            if re.search(r'\bOVAs?\b|\bOAV\b', rem_item, re.I):
+            if RE_OVAS.search(rem_item):
                 if 'OVA' not in generic_tags: generic_tags.append('OVA')
-                rem_item = re.sub(r'\bOVAs?\b|\bOAV\b', '', rem_item, flags=re.I).strip()
+                rem_item = RE_OVAS.sub('', rem_item).strip()
 
-            if re.search(r'\bSpecials?\b|\bShorts\b', rem_item, re.I):
+            if RE_SPECIALS.search(rem_item):
                 if 'SP' not in generic_tags: generic_tags.append('SP')
-                rem_item = re.sub(r'\bSpecials?\b|\bShorts\b', '', rem_item, flags=re.I).strip()
+                rem_item = RE_SPECIALS.sub('', rem_item).strip()
 
-            if re.search(r'Complete Series|Complete Movies Series|Complete', rem_item, re.I):
+            if RE_COMPLETE.search(rem_item):
                 if 'Complete' not in generic_tags: generic_tags.append('Complete')
-                rem_item = re.sub(r'Complete Series|Complete Movies Series|Complete', '', rem_item, flags=re.I).strip()
+                rem_item = RE_COMPLETE.sub('', rem_item).strip()
 
-            if re.search(r'Directors Cut|DC', rem_item, re.I):
+            if RE_DIRECTORS_CUT.search(rem_item):
                 if 'DC' not in generic_tags: generic_tags.append('DC')
-                rem_item = re.sub(r'Directors Cut|DC', '', rem_item, flags=re.I).strip()
+                rem_item = RE_DIRECTORS_CUT.sub('', rem_item).strip()
 
-            if re.search(r'OST', rem_item, re.I):
+            if RE_OST.search(rem_item):
                 if 'OST' not in generic_tags: generic_tags.append('OST')
-                rem_item = re.sub(r'OST', '', rem_item, flags=re.I).strip()
+                rem_item = RE_OST.sub('', rem_item).strip()
 
-            rem_item = re.sub(r'^\W+|\W+$', '', rem_item)
+            rem_item = RE_TRIM_PUNCT.sub('', rem_item)
             if rem_item:
                 named_subtitles.append(rem_item)
 
-    base_title = re.sub(r'\bComplete Series\b|\bComplete\b', '', base_title, flags=re.I).strip()
-    base_title = re.sub(r'\s+', ' ', base_title).strip(' -:')
+    base_title = RE_COMPLETE.sub('', base_title).strip()
+    base_title = RE_WHITESPACE.sub(' ', base_title).strip(' -:')
 
     clean_title = base_title
     if named_subtitles:
@@ -325,177 +623,14 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
     return clean_title, path_dir, tags_str
 
 def save_history_entry(title, payload):
-    hist_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if hist_file.exists():
-            with open(hist_file, "r") as f: hist = json.load(f)
-        else: hist = {}
-    except Exception:
-        hist = {}
-    if not isinstance(hist, dict): hist = {}
-
-    target_url = payload.get("anime_url", "")
-    clean_target = parse_anime_title(title)[0]
-    
-    existing = {}
-    existing_watched = []
-    keys_to_remove = []
-    
-    for k, v in hist.items():
-        if isinstance(v, dict):
-            k_clean = parse_anime_title(k)[0]
-            v_url = v.get("anime_url", "")
-            if (target_url and v_url == target_url) or k == title or k_clean == clean_target:
-                if not existing:
-                    existing = v
-                if "watched" in v and isinstance(v["watched"], list):
-                    existing_watched.extend(v["watched"])
-                if "raw_title" in v and "raw_title" not in payload:
-                    payload["raw_title"] = v["raw_title"]
-                keys_to_remove.append(k)
-
-    for k in keys_to_remove:
-        del hist[k]
-
-    if "watched" in payload and isinstance(payload["watched"], list):
-        payload["watched"] = list(set(payload["watched"]))
-    else:
-        payload["watched"] = list(set(existing_watched))
-
-    curr_raw = payload.get("raw_title", "")
-    prev_raw = existing.get("raw_title", "") if isinstance(existing, dict) else ""
-    
-    candidates_raw = [curr_raw, prev_raw, title]
-    if payload.get("selected_file_name"):
-        candidates_raw.append(payload["selected_file_name"])
-    if payload.get("source_label"):
-        candidates_raw.append(payload["source_label"])
-    for ep in payload.get("episodes", []):
-        if isinstance(ep, (list, tuple)) and len(ep) > 0:
-            candidates_raw.append(ep[0])
-        elif isinstance(ep, str):
-            candidates_raw.append(ep)
-
-    raw_matches = [c for c in candidates_raw if c and is_raw_release_title(c)]
-    if raw_matches:
-        best_raw = raw_matches[0]
-    else:
-        valid_cands = [c for c in (curr_raw, prev_raw, title) if c]
-        best_raw = max(valid_cands, key=len) if valid_cands else title
-
-    clean_t, _, tags_str = parse_anime_title(best_raw)
-    
-    if not tags_str:
-        for cand in candidates_raw:
-            if cand:
-                _, _, t_str = parse_anime_title(cand)
-                if t_str:
-                    tags_str = t_str
-                    break
-
-    payload["raw_title"] = best_raw
-    payload["tags"] = tags_str
-
-    hist[clean_t] = payload
-    tmp_file = hist_file.with_suffix(".tmp")
-    try:
-        with open(tmp_file, "w") as f: json.dump(hist, f, indent=2)
-        tmp_file.replace(hist_file)
-    except Exception:
-        pass
+    history_store.save_entry(title, payload)
 
 def load_history():
-    if not hist_file.exists():
-        return {}
-    try:
-        with open(hist_file, "r") as f: hist = json.load(f)
-        if isinstance(hist, dict):
-            dedup = {}
-            for k, v in hist.items():
-                if not isinstance(v, dict):
-                    continue
-                url = v.get("anime_url") or k
-                curr_raw = v.get("raw_title") or k
-                
-                if url not in dedup:
-                    dedup[url] = (curr_raw, v)
-                else:
-                    prev_raw, prev_v = dedup[url]
-                    if is_raw_release_title(curr_raw) and not is_raw_release_title(prev_raw):
-                        best_raw = curr_raw
-                    elif is_raw_release_title(prev_raw) and not is_raw_release_title(curr_raw):
-                        best_raw = prev_raw
-                    else:
-                        best_raw = curr_raw if len(curr_raw) > len(prev_raw) else prev_raw
-                        
-                    t_curr = v.get("last_played", "")
-                    t_prev = prev_v.get("last_played", "")
-                    best_v = v if t_curr > t_prev else prev_v
-                    
-                    w1 = prev_v.get("watched", [])
-                    w2 = v.get("watched", [])
-                    best_v["watched"] = list(set(w1 + w2))
-                    
-                    dedup[url] = (best_raw, best_v)
-
-            cleaned_hist = {}
-            for url, (raw, v) in dedup.items():
-                clean_t, _, tags_str = parse_anime_title(raw)
-                if not tags_str and isinstance(v, dict):
-                    tags_str = v.get("tags", "")
-                if not tags_str and isinstance(v, dict):
-                    cands = [v.get("selected_file_name"), v.get("source_label")]
-                    for ep in v.get("episodes", []):
-                        if isinstance(ep, (list, tuple)) and len(ep) > 0: cands.append(ep[0])
-                    for cand in cands:
-                        if cand:
-                            _, _, t_str = parse_anime_title(cand)
-                            if t_str:
-                                tags_str = t_str
-                                break
-                v["raw_title"] = raw
-                v["tags"] = tags_str
-                
-                if clean_t in cleaned_hist:
-                    existing_v = cleaned_hist[clean_t]
-                    w1 = existing_v.get("watched", [])
-                    w2 = v.get("watched", [])
-                    v["watched"] = list(set(w1 + w2))
-
-                cleaned_hist[clean_t] = v
-
-            sorted_entries = sorted(
-                cleaned_hist.items(),
-                key=lambda item: item[1].get("last_played", "") if isinstance(item[1], dict) else "",
-                reverse=True
-            )
-            return dict(sorted_entries)
-    except Exception:
-        pass
-    return {}
+    return history_store.get_all()
 
 def delete_history_entry(title):
-    if not hist_file.exists():
-        return False
-    try:
-        with open(hist_file, "r") as f:
-            hist = json.load(f)
-        if not isinstance(hist, dict):
-            return False
-            
-        clean_target = parse_anime_title(title)[0]
-        keys_to_delete = [k for k in hist.keys() if k == title or parse_anime_title(k)[0] == clean_target]
-        if keys_to_delete:
-            for k in keys_to_delete:
-                del hist[k]
-            tmp_file = hist_file.with_suffix(".tmp")
-            with open(tmp_file, "w") as f:
-                json.dump(hist, f, indent=2)
-            tmp_file.replace(hist_file)
-            return True
-    except Exception:
-        pass
-    return False
+    return history_store.delete_entry(title)
+
 
 def toggle_watched_entry(title, item_name=None):
     hist = load_history()
@@ -1136,7 +1271,12 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
         if reload_cmd:
             cmd.append(f"--bind=start:reload({reload_cmd})")
             if anime_title:
-                cmd.append(f"--bind=ctrl-w:reload({reload_cmd} --toggle {{3}})")
+                script_path = os.path.abspath(__file__)
+                toggle_cmd = (
+                    f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} "
+                    f"--internal-fetch toggle_watched {shlex.quote(anime_title)} {{3}}"
+                )
+                cmd.append(f"--bind=ctrl-w:execute({toggle_cmd})+reload({reload_cmd})")
             else:
                 cmd.append(f"--bind=ctrl-w:reload({reload_cmd})")
         else:
@@ -1214,7 +1354,7 @@ def fzf_search_prompt():
                 lbl = format_history_label(t, entry)
                 items.append(lbl)
                 hist_map[lbl] = t
-                plain_lbl = re.sub(r'\033\[[0-9;]*m', '', lbl)
+                plain_lbl = RE_ANSI_ESCAPE.sub('', lbl)
                 hist_map[plain_lbl] = t
             
             header = build_header(['search'])
@@ -1254,7 +1394,7 @@ def fzf_search_prompt():
 
                 real_title = None
                 if selected_item:
-                    plain_sel = re.sub(r'\033\[[0-9;]*m', '', selected_item)
+                    plain_sel = RE_ANSI_ESCAPE.sub('', selected_item)
                     real_title = hist_map.get(selected_item) or hist_map.get(plain_sel)
                     if not real_title and selected_item.startswith("[History] "):
                         real_title = selected_item[len("[History] "):].strip()
@@ -1420,16 +1560,16 @@ def stream_in_mpv(download_url, title=None) -> bool:
     return max_percent >= 80.0
 
 def download_file(url, output_name):
-    download_dir = CONFIG.get("download_dir", ".")
-    dest_path = os.path.join(download_dir, output_name)
-    if download_dir != ".":
-        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    download_dir = Path(CONFIG.get("download_dir", ".")).resolve()
+    safe_name = Path(output_name).name
+    dest_path = download_dir / safe_name
+    download_dir.mkdir(parents=True, exist_ok=True)
     print(f"Downloading to {dest_path}...")
     curl_flags = [
         'curl', '-L', '--progress-bar',
         '-A', UA,
         '-H', f'Cookie: {_cookie_header()}',
-        '-o', dest_path,
+        '-o', str(dest_path),
         url
     ]
     try:
@@ -2176,7 +2316,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
     parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history (and exit)")
-    parser.add_argument("--version", action="version", version="anitokiPy 2.0")
+    parser.add_argument("--version", action="version", version="anitokiPy 2.1")
     parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -2198,10 +2338,7 @@ def main():
     initial_query = raw_query if raw_query else None
 
     if getattr(args, 'clear_history', False):
-        try:
-            hist_file.unlink(missing_ok=True)
-        except TypeError:
-            if hist_file.exists(): hist_file.unlink()
+        history_store.clear()
         print("History cleared.")
         return
 
