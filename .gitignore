@@ -1,6 +1,6 @@
 /.venv
 /__pycache__
-/anitokiPy.egg-info
+/animetoki_cli.egg-info
 /build
 *.jpg
 /tests

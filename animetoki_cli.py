@@ -27,25 +27,36 @@ except ImportError:
     termios = None
 
 # Set up logging early so all components can log warnings/errors
-log_dir = Path.home() / ".local" / "share" / "anitokipy"
+log_dir = Path.home() / ".local" / "share" / "animetoki-cli"
 try:
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        filename=str(log_dir / "anitokipy.log"),
+        filename=str(log_dir / "animetoki-cli.log"),
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 except Exception:
     logging.basicConfig(level=logging.ERROR)
 
-logger = logging.getLogger("anitokipy")
+logger = logging.getLogger("animetoki-cli")
 
 base_url = "https://animetoki.com"
 search_url = "https://animetoki.com/?s="
 
-hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
-COOKIE_PATH = Path.home() / ".local" / "state" / "anitokipy" / "cookies.json"
-CACHE_FILE = Path.home() / ".local" / "state" / "anitokipy" / "cache.json"
+hist_dir = Path.home() / ".local" / "state" / "animetoki-cli"
+hist_dir.mkdir(parents=True, exist_ok=True)
+old_hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
+
+hist_file = hist_dir / "ani-hsts"
+if not hist_file.exists() and old_hist_file.exists():
+    try:
+        import shutil
+        shutil.copy2(old_hist_file, hist_file)
+    except Exception:
+        hist_file = old_hist_file
+
+COOKIE_PATH = hist_dir / "cookies.json"
+CACHE_FILE = hist_dir / "cache.json"
 
 session = None
 
@@ -1100,16 +1111,16 @@ if len(sys.argv) > 1 and sys.argv[1] == "--internal-fetch":
 
 # HEAVY INITIALIZATIONS ONLY RUN IN INTERACTIVE / MPV MODE
 import logging
-log_dir = Path.home() / ".local" / "share" / "anitokipy"
+log_dir = Path.home() / ".local" / "share" / "animetoki-cli"
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    filename=str(log_dir / "anitokipy.log"),
+    filename=str(log_dir / "animetoki-cli.log"),
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("anitokipy")
+logger = logging.getLogger("animetoki-cli")
 
-CONFIG_PATH = Path.home() / ".config" / "anitokipy" / "config.json"
+CONFIG_PATH = Path.home() / ".config" / "animetoki-cli" / "config.json"
 
 def load_config():
     defaults = {
@@ -1500,7 +1511,7 @@ def stream_in_mpv(download_url, title=None) -> bool:
         )
         return True
 
-    socket_path = f"/tmp/anitokipy_mpv_{os.getpid()}.sock"
+    socket_path = f"/tmp/animetoki_cli_mpv_{os.getpid()}.sock"
     if os.path.exists(socket_path):
         try: os.unlink(socket_path)
         except OSError: pass
@@ -2332,7 +2343,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
     parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history (and exit)")
-    parser.add_argument("--version", action="version", version="anitokiPy 2.3")
+    parser.add_argument("--version", action="version", version="animetoki-cli 2.4")
     parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
 

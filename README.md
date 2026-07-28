@@ -1,6 +1,6 @@
-# AnitokiPy
+# Animetoki CLI
 
-CLI for [animetoki.com](https://animetoki.com/). Stream or download anime from terminal.
+Stream/Download anime from [animetoki.com](https://animetoki.com/) on terminal.
 
 ## Dependencies
 
@@ -13,8 +13,8 @@ CLI for [animetoki.com](https://animetoki.com/). Stream or download anime from t
 ```bash
 pip install -e .
 
-anitokipy               # Interactive CLI
-anitokipy "anime title" # Direct search
+animetoki-cli               # Interactive CLI
+animetoki-cli "anime title" # Direct search
 ```
 
 ## Options
@@ -26,7 +26,7 @@ anitokipy "anime title" # Direct search
 
 ## Config File
 
-`~/.config/anitokipy/config.json`:
+`~/.config/animetoki-cli/config.json`:
 
 ```json
 {
