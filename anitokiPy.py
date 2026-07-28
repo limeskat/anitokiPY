@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import urllib.request
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
-from bs4 import BeautifulSoup, Tag
-from curl_cffi import requests as cffi_requests
 try:
     import termios
 except ImportError:
@@ -67,6 +65,40 @@ search_url = "https://animetoki.com/?s="
 session = None
 hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
 COOKIE_PATH = Path.home() / ".local" / "state" / "anitokipy" / "cookies.json"
+CACHE_FILE = Path.home() / ".local" / "state" / "anitokipy" / "cache.json"
+
+def load_fetch_cache():
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_fetch_cache(cache):
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        tmp.replace(CACHE_FILE)
+    except Exception:
+        pass
+
+def get_cached_fetch(key, ttl=300):
+    cache = load_fetch_cache()
+    entry = cache.get(key)
+    if isinstance(entry, dict) and "time" in entry and "data" in entry:
+        if time.time() - entry["time"] < ttl:
+            return entry["data"]
+    return None
+
+def set_cached_fetch(key, data):
+    cache = load_fetch_cache()
+    cache[key] = {"time": time.time(), "data": data}
+    save_fetch_cache(cache)
 
 def save_cookies():
     if not session or not hasattr(session, "cookies"):
@@ -154,31 +186,32 @@ def save_history_entry(title, payload):
     if not isinstance(hist, dict): hist = {}
 
     target_url = payload.get("anime_url", "")
+    clean_target = parse_anime_title(title)[0]
     
     existing = {}
+    existing_watched = []
     keys_to_remove = []
+    
     for k, v in hist.items():
         if isinstance(v, dict):
-            if (target_url and v.get("anime_url") == target_url) or k == title:
+            k_clean = parse_anime_title(k)[0]
+            v_url = v.get("anime_url", "")
+            if (target_url and v_url == target_url) or k == title or k_clean == clean_target:
                 if not existing:
                     existing = v
-                else:
-                    w1 = existing.get("watched", [])
-                    w2 = v.get("watched", [])
-                    existing["watched"] = list(set(w1 + w2))
+                if "watched" in v and isinstance(v["watched"], list):
+                    existing_watched.extend(v["watched"])
+                if "raw_title" in v and "raw_title" not in payload:
+                    payload["raw_title"] = v["raw_title"]
                 keys_to_remove.append(k)
 
     for k in keys_to_remove:
         del hist[k]
 
-    if isinstance(existing, dict):
-        if "watched" in existing and "watched" not in payload:
-            payload["watched"] = existing["watched"]
-        if "raw_title" in existing and "raw_title" not in payload:
-            payload["raw_title"] = existing["raw_title"]
-
-    if "watched" not in payload:
-        payload["watched"] = []
+    if "watched" in payload and isinstance(payload["watched"], list):
+        payload["watched"] = list(set(payload["watched"]))
+    else:
+        payload["watched"] = list(set(existing_watched))
 
     curr_raw = payload.get("raw_title", "")
     prev_raw = existing.get("raw_title", "") if isinstance(existing, dict) else ""
@@ -274,6 +307,13 @@ def load_history():
                                 break
                 v["raw_title"] = raw
                 v["tags"] = tags_str
+                
+                if clean_t in cleaned_hist:
+                    existing_v = cleaned_hist[clean_t]
+                    w1 = existing_v.get("watched", [])
+                    w2 = v.get("watched", [])
+                    v["watched"] = list(set(w1 + w2))
+
                 cleaned_hist[clean_t] = v
 
             sorted_entries = sorted(
@@ -296,7 +336,8 @@ def delete_history_entry(title):
         if not isinstance(hist, dict):
             return False
             
-        keys_to_delete = [k for k in hist.keys() if k == title or parse_anime_title(k)[0] == title]
+        clean_target = parse_anime_title(title)[0]
+        keys_to_delete = [k for k in hist.keys() if k == title or parse_anime_title(k)[0] == clean_target]
         if keys_to_delete:
             for k in keys_to_delete:
                 del hist[k]
@@ -315,7 +356,15 @@ def toggle_watched_entry(title, item_name=None):
     hist = load_history()
     if not hist or not title:
         return
+    
+    clean_t = parse_anime_title(title)[0]
     entry = hist.get(title)
+    if not isinstance(entry, dict):
+        for k, v in hist.items():
+            if k == title or parse_anime_title(k)[0] == clean_t:
+                entry = v
+                break
+
     if not isinstance(entry, dict):
         return
 
@@ -340,15 +389,28 @@ def toggle_watched_entry(title, item_name=None):
         watched.append(item_name)
 
     entry["watched"] = watched
-    save_history_entry(title, entry)
+    save_history_entry(clean_t, entry)
 
 def get_watched_list(hist_ctx_or_title):
-    """Return list of watched items for given HistoryContext or title string."""
-    title = getattr(hist_ctx_or_title, "title", None) if hist_ctx_or_title else hist_ctx_or_title
-    if not title:
+    if not hist_ctx_or_title:
         return []
+    if isinstance(hist_ctx_or_title, str):
+        title = hist_ctx_or_title
+    else:
+        title = getattr(hist_ctx_or_title, "title", "")
+        if callable(title):
+            title = str(hist_ctx_or_title)
+    if not title or not isinstance(title, str):
+        return []
+
     hist = load_history()
-    entry = hist.get(title, {})
+    entry = hist.get(title)
+    if not isinstance(entry, dict):
+        clean_t = parse_anime_title(title)[0]
+        for k, v in hist.items():
+            if k == title or parse_anime_title(k)[0] == clean_t:
+                entry = v
+                break
     return list(entry.get("watched", [])) if isinstance(entry, dict) else []
 
 def update_history(title, url, raw_title=""):
@@ -741,7 +803,7 @@ def flush_stdin():
         except Exception:
             pass
 
-def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, footer=None, reload_cmd=None):
+def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, footer=None, reload_cmd=None, anime_title=None):
     flush_stdin()
     if isinstance(footer, list):
         footer_text = build_footer(footer)
@@ -765,11 +827,20 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
             "--prompt", prompt,
             "--with-nth=2",
             "--delimiter=\t",
-            "--expect=left,right,ctrl-c,ctrl-d,ctrl-w,ctrl-x",
+            "--expect=left,right,ctrl-c,ctrl-d,ctrl-x",
             f"--footer={footer_text}"
         ]
         if reload_cmd:
             cmd.append(f"--bind=start:reload({reload_cmd})")
+            if anime_title:
+                script_path = os.path.abspath(__file__)
+                toggle_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch toggle_watched {shlex.quote(anime_title)} {{3}}"
+                cmd.append(f"--bind=ctrl-w:execute-silent({toggle_cmd})+reload({reload_cmd})")
+            else:
+                cmd.append(f"--bind=ctrl-w:reload({reload_cmd})")
+        else:
+            cmd[12] = "--expect=left,right,ctrl-c,ctrl-d,ctrl-w,ctrl-x"
+
         if header:
             cmd.append(f"--header={header}")
         if default_idx is not None and default_idx >= 0:
@@ -885,12 +956,12 @@ def fzf_search_prompt():
                         real_title = selected_item[len("[History] "):].strip()
 
                 if key_pressed == "ctrl-d":
-                    if real_title and real_title in hist:
+                    if real_title:
                         delete_history_entry(real_title)
                     continue
 
                 if key_pressed == "ctrl-w":
-                    if real_title and real_title in hist:
+                    if real_title:
                         toggle_watched_entry(real_title)
                     continue
 
@@ -919,6 +990,7 @@ def init_session():
     global session
     if session is not None:
         return
+    from curl_cffi import requests as cffi_requests
     session = cffi_requests.Session(impersonate="firefox133")
     load_cookies()
     try:
@@ -1137,6 +1209,7 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
         return
+    from bs4 import BeautifulSoup
     soup_anime_list = BeautifulSoup(res_search_animes.content, 'html.parser')
     anime_list = soup_anime_list.select('.post-item-inner > a:first-child')
     if not anime_list:
@@ -1311,6 +1384,7 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
     res_anime = safe_request('get', selected_anime_url)
     if not res_anime:
         return
+    from bs4 import BeautifulSoup
     soup_anime_list = BeautifulSoup(res_anime.content, 'html.parser')
 
     anime_title = soup_anime_list.find('h1', class_="post-title entry-title")
@@ -1324,7 +1398,6 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
         best_raw = raw_title if len(raw_title) > len(page_raw_title) else page_raw_title
 
     clean_title, path_dir, tags_str = parse_anime_title(best_raw)
-    update_history(clean_title, selected_anime_url, raw_title=best_raw)
 
     cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
     cdn_links = soup_anime_list.select('a.shortc-button[href]')
@@ -1403,6 +1476,13 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
                 return "main_menu"
 
 def fetch_content(url):
+    cached = get_cached_fetch("cloud:" + url)
+    if cached:
+        files_data = cached.get("files", [])
+        node_idx = cached.get("node_index", "")
+        files = [CloudFile(**x) for x in files_data]
+        return files, node_idx
+
     post_response = safe_request('post', url)
     if not post_response:
         return None, None
@@ -1421,23 +1501,29 @@ def fetch_content(url):
     initial_node_index = str(dict_json_.get("node_index", ""))
     initial_file_list.sort(key=lambda item: natural_sort_key(item.get("name", "")))
     
-    files = [
-        CloudFile(
-            name=x.get("name", ""),
-            id=x.get("id", ""),
-            mime_type=x.get("mimeType", ""),
-            node_index=initial_node_index,
-            size=int(x.get("size", 0) or 0)
-        )
+    files_data = [
+        {
+            "name": x.get("name", ""),
+            "id": x.get("id", ""),
+            "mime_type": x.get("mimeType", ""),
+            "node_index": initial_node_index,
+            "size": int(x.get("size", 0) or 0)
+        }
         for x in initial_file_list
     ]
-        
+    set_cached_fetch("cloud:" + url, {"files": files_data, "node_index": initial_node_index})
+    files = [CloudFile(**x) for x in files_data]
     return files, initial_node_index
 
 def fetch_worker_folder(url):
+    cached = get_cached_fetch("worker:" + url)
+    if cached:
+        return [tuple(x) for x in cached]
+
     res = safe_request('get', url)
     if not res:
         return None
+    from bs4 import BeautifulSoup
     soup = BeautifulSoup(res.content, 'html.parser')
     
     folder_parsed = urlparse(url)
@@ -1463,6 +1549,7 @@ def fetch_worker_folder(url):
         return None
     
     entries.sort(key=lambda e: natural_sort_key(e[0]))
+    set_cached_fetch("worker:" + url, entries)
     return entries
 
 def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=None):
@@ -1488,8 +1575,9 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
 
         if use_fzf:
             script_path = os.path.abspath(__file__)
-            reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch worker_folder {shlex.quote(current_url)}"
-            res = fzf_select(prompt="Select: ", header=header, footer=footer, reload_cmd=reload_cmd)
+            anime_t = hist_ctx.title if hist_ctx else ""
+            reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch worker_folder {shlex.quote(current_url)} {shlex.quote(anime_t)}"
+            res = fzf_select(prompt="Select: ", header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
             if res is None:
                 if folder_stack:
                     current_url = folder_stack.pop()
@@ -1685,8 +1773,9 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
         if not selected_file:
             if use_fzf:
                 script_path = os.path.abspath(__file__)
-                reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch cloud_folder {shlex.quote(current_folder_url)}"
-                res = fzf_select(prompt="Select file: ", header=header, footer=footer, reload_cmd=reload_cmd)
+                anime_t = hist_ctx.title if hist_ctx else ""
+                reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch cloud_folder {shlex.quote(current_folder_url)} {shlex.quote(anime_t)}"
+                res = fzf_select(prompt="Select file: ", header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
                 if res is None:
                     if folder_stack:
                         current_folder_url = folder_stack.pop()
@@ -1890,24 +1979,38 @@ def signal_handler(sig, frame):
 def run_internal_fetch(args):
     if not args:
         sys.exit(1)
+    from bs4 import BeautifulSoup
     init_session()
     action = args[0]
     action_args = args[1:]
     
     try:
-        if action == "search":
+        if action == "toggle_watched":
+            anime_title = action_args[0] if len(action_args) > 0 else ""
+            item_name = action_args[1] if len(action_args) > 1 else ""
+            if anime_title and item_name:
+                toggle_watched_entry(anime_title, item_name)
+            sys.exit(0)
+
+        elif action == "search":
             query = " ".join(action_args)
-            res = safe_request('get', search_url + query)
-            if not res:
-                print(f"ERROR: Failed to connect for query '{query}'")
-                sys.exit(1)
-            soup = BeautifulSoup(res.content, 'html.parser')
-            anime_list = soup.select('.post-item-inner > a:first-child')
-            if not anime_list:
-                print("ERROR: No results found.")
-                sys.exit(1)
-            raw_names = [a.get('aria-label', 'Unknown') for a in anime_list]
-            urls = [urljoin(base_url, a['href']) for a in anime_list]
+            cached = get_cached_fetch("search:" + query)
+            if cached:
+                raw_names, urls = cached["raw_names"], cached["urls"]
+            else:
+                res = safe_request('get', search_url + query)
+                if not res:
+                    print(f"ERROR: Failed to connect for query '{query}'")
+                    sys.exit(1)
+                soup = BeautifulSoup(res.content, 'html.parser')
+                anime_list = soup.select('.post-item-inner > a:first-child')
+                if not anime_list:
+                    print("ERROR: No results found.")
+                    sys.exit(1)
+                raw_names = [a.get('aria-label', 'Unknown') for a in anime_list]
+                urls = [urljoin(base_url, a['href']) for a in anime_list]
+                set_cached_fetch("search:" + query, {"raw_names": raw_names, "urls": urls})
+
             for i, (name, url) in enumerate(zip(raw_names, urls)):
                 lbl = format_anime_title_label(name)
                 print(f"{i}\t{lbl}\t{url}\t{name}")
@@ -1915,53 +2018,64 @@ def run_internal_fetch(args):
         elif action == "anime_sources":
             selected_anime_url = action_args[0]
             raw_title = action_args[1] if len(action_args) > 1 else ""
-            res_anime = safe_request('get', selected_anime_url)
-            if not res_anime:
-                print("ERROR: Failed to fetch anime details.")
-                sys.exit(1)
-            soup = BeautifulSoup(res_anime.content, 'html.parser')
-            anime_title = soup.find('h1', class_="post-title entry-title")
-            page_raw_title = anime_title.get_text().strip() if anime_title else "Unknown"
-            best_raw = raw_title if (raw_title and is_raw_release_title(raw_title)) else (page_raw_title if is_raw_release_title(page_raw_title) else (raw_title if len(raw_title) > len(page_raw_title) else page_raw_title))
-            clean_title, _, _ = parse_anime_title(best_raw)
-            update_history(clean_title, selected_anime_url, raw_title=best_raw)
+            cached = get_cached_fetch("sources:" + selected_anime_url)
+            if cached:
+                items_data, best_raw = cached["items_data"], cached["best_raw"]
+            else:
+                res_anime = safe_request('get', selected_anime_url)
+                if not res_anime:
+                    print("ERROR: Failed to fetch anime details.")
+                    sys.exit(1)
+                soup = BeautifulSoup(res_anime.content, 'html.parser')
+                anime_title = soup.find('h1', class_="post-title entry-title")
+                page_raw_title = anime_title.get_text().strip() if anime_title else "Unknown"
+                best_raw = raw_title if (raw_title and is_raw_release_title(raw_title)) else (page_raw_title if is_raw_release_title(page_raw_title) else (raw_title if len(raw_title) > len(page_raw_title) else page_raw_title))
 
-            cloud_links = soup.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
-            cdn_links = [a for a in soup.select('a.shortc-button[href]') if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
-            all_links = list(cloud_links) + list(cdn_links)
-            if not all_links:
-                print("ERROR: No streaming links found for this anime.")
-                sys.exit(1)
-            for i, link in enumerate(all_links):
-                label = link.get_text(strip=True)
-                href = urljoin(base_url, link['href'])
-                link_type = classify_link(href)
-                if link_type == 'cloud':
-                    parsed = urlparse(href)
-                    domain_url = f"https://{parsed.netloc}/"
-                    segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
-                    href = domain_url + "/".join(segments) + "/"
+                cloud_links = soup.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
+                cdn_links = [a for a in soup.select('a.shortc-button[href]') if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
+                all_links = list(cloud_links) + list(cdn_links)
+                if not all_links:
+                    print("ERROR: No streaming links found for this anime.")
+                    sys.exit(1)
+                items_data = []
+                for link in all_links:
+                    label = link.get_text(strip=True)
+                    href = urljoin(base_url, link['href'])
+                    link_type = classify_link(href)
+                    if link_type == 'cloud':
+                        parsed = urlparse(href)
+                        domain_url = f"https://{parsed.netloc}/"
+                        segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
+                        href = domain_url + "/".join(segments) + "/"
+                    items_data.append((label, href, link_type))
+                set_cached_fetch("sources:" + selected_anime_url, {"items_data": items_data, "best_raw": best_raw})
+
+            for i, (label, href, link_type) in enumerate(items_data):
                 lbl = format_item_label(label, link_type)
                 print(f"{i}\t{lbl}\t{label}\t{href}\t{link_type}\t{best_raw}")
 
         elif action == "cloud_folder":
             url = action_args[0]
+            anime_title = action_args[1] if len(action_args) > 1 else ""
+            watched = get_watched_list(anime_title)
             files, _ = fetch_content(url)
             if not files:
                 print("ERROR: No files found in cloud folder.")
                 sys.exit(1)
             for i, cf in enumerate(files):
-                lbl = format_cloud_file_label(cf)
+                lbl = format_cloud_file_label(cf, is_watched=(cf.name in watched))
                 print(f"{i}\t{lbl}\t{cf.name}\t{cf.id}\t{cf.mime_type}\t{cf.node_index}\t{cf.size}")
 
         elif action == "worker_folder":
             url = action_args[0]
+            anime_title = action_args[1] if len(action_args) > 1 else ""
+            watched = get_watched_list(anime_title)
             entries = fetch_worker_folder(url)
             if not entries:
                 print("ERROR: No entries found in worker folder.")
                 sys.exit(1)
             for i, (label, full_url, link_type) in enumerate(entries):
-                lbl = format_item_label(label, link_type)
+                lbl = format_item_label(label, link_type, is_watched=(label in watched))
                 print(f"{i}\t{lbl}\t{label}\t{full_url}\t{link_type}")
         sys.exit(0)
     except Exception as e:
