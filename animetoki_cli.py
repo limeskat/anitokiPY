@@ -14,7 +14,7 @@ import shlex
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
+from urllib.parse import urljoin, unquote, quote, urlparse, parse_qs, urlencode
 
 try:
     import fcntl
@@ -940,7 +940,10 @@ def fetch_content(url):
 def fetch_worker_folder(url):
     cached = get_cached_fetch("worker:" + url)
     if cached:
-        return [tuple(x) for x in cached]
+        cached_entries = [tuple(x) for x in cached]
+        valid_cached = [e for e in cached_entries if len(e) > 1 and e[1] and not e[1].endswith('#') and e[0] not in ('Download', 'Report Issue', 'Home', 'Back')]
+        if valid_cached:
+            return valid_cached
 
     res = safe_request('get', url)
     if not res:
@@ -967,8 +970,22 @@ def fetch_worker_folder(url):
         link_type = classify_link(full_url)
         entries.append((label, full_url, link_type))
     
-    if not entries:
-        return None
+    valid_entries = [e for e in entries if e[1] and not e[1].endswith('#') and e[0] not in ('Download', 'Report Issue', 'Home', 'Back')]
+    
+    if not valid_entries:
+        files, _ = fetch_content(url)
+        if files:
+            entries = []
+            base_u = url if url.endswith('/') else url + '/'
+            for cf in files:
+                f_url = base_u + quote(cf.name)
+                mime = cf.mime_type.lower() if cf.mime_type else ''
+                ltype = 'worker_folder' if ('folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder') else classify_link(cf.name)
+                entries.append((cf.name, f_url, ltype))
+        else:
+            return None
+    else:
+        entries = valid_entries
     
     entries.sort(key=lambda e: natural_sort_key(e[0]))
     set_cached_fetch("worker:" + url, entries)
@@ -1289,7 +1306,7 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
             "--prompt", prompt,
             "--with-nth=2",
             "--delimiter=\t",
-            "--expect=left,right,ctrl-c,ctrl-d,ctrl-x",
+            "--expect=left,right,ctrl-c,ctrl-d,ctrl-x,ctrl-w",
             f"--footer={footer_text}"
         ]
         if reload_cmd:
@@ -1308,7 +1325,7 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
         if default_idx is not None and default_idx >= 0:
             pos_str = str(default_idx + 1)
             if reload_cmd:
-                cmd.append(f"--bind=start:reload({reload_cmd})+pos({pos_str})")
+                cmd.append(f"--bind=start:reload({reload_cmd}),load:pos({pos_str})+unbind(load)")
             else:
                 cmd.append(f"--bind=start:pos({pos_str})")
         elif reload_cmd:
@@ -1363,6 +1380,26 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
     if idx == 0 or idx is None:
         return None
     return idx - 1
+
+def parse_fzf_result(res):
+    if res is None:
+        return None, None, []
+    if isinstance(res, str):
+        return res, None, []
+    if isinstance(res, tuple):
+        if isinstance(res[0], str):
+            act = res[0]
+            idx = res[1] if len(res) > 1 else None
+            raw = res[2] if len(res) > 2 else []
+            return act, idx, raw
+        elif isinstance(res[0], int):
+            return None, res[0], res[1] if len(res) > 1 and isinstance(res[1], list) else []
+        elif res[0] is None and len(res) > 1:
+            return None, None, res[1] if isinstance(res[1], list) else []
+    elif isinstance(res, int):
+        return None, res, []
+    return None, None, []
+
 
 def fzf_search_prompt():
     flush_stdin()
@@ -1659,37 +1696,27 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
     default_idx = None
     while True:
         res = fzf_select(display_names, "Select anime: ", default_idx=default_idx, header=header, footer=footer)
+        act, idx, raw = parse_fzf_result(res)
         if res is None:
             break
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+        if act == "main_menu":
             return "main_menu"
-        if isinstance(res, tuple):
-            act, idx = res[:2]
-            if idx is not None and 0 <= idx < len(anime_urls):
-                default_idx = idx
-            if act == "main_menu":
-                return "main_menu"
-            elif act == "delete":
-                if default_idx is not None:
-                    clean_t, _, _ = parse_anime_title(raw_anime_names[default_idx])
-                    delete_history_entry(clean_t)
+        if idx is not None and 0 <= idx < len(anime_urls):
+            default_idx = idx
+            if act == "delete":
+                clean_t, _, _ = parse_anime_title(raw_anime_names[idx])
+                delete_history_entry(clean_t)
                 continue
             elif act == "toggle_watched":
-                if default_idx is not None:
-                    clean_t, _, _ = parse_anime_title(raw_anime_names[default_idx])
-                    toggle_watched_entry(clean_t)
+                clean_t, _, _ = parse_anime_title(raw_anime_names[idx])
+                toggle_watched_entry(clean_t)
                 continue
-            idx = default_idx
-        else:
-            idx = res
-            default_idx = idx
-
-        if idx is not None and 0 <= idx < len(anime_urls):
-            selected_anime_url = anime_urls[idx]
-            raw_anime_name = raw_anime_names[idx] if idx < len(raw_anime_names) else ""
-            r = anime_download_link(selected_anime_url, download_mode=download_mode, raw_title=raw_anime_name)
-            if r == "main_menu":
-                return "main_menu"
+            else:
+                selected_anime_url = anime_urls[idx]
+                raw_anime_name = raw_anime_names[idx] if idx < len(raw_anime_names) else ""
+                r = anime_download_link(selected_anime_url, download_mode=download_mode, raw_title=raw_anime_name)
+                if r == "main_menu":
+                    return "main_menu"
 
 def resolve_stream_url(url):
     parsed = urlparse(url)
@@ -1777,8 +1804,16 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
                         )
                         if link_type == 'cloud':
                             result = {"type": "cloud", "url": encode_cloud_url(selected_url), "hist_ctx": hist_ctx}
-                        elif link_type == 'direct_video':
-                            result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
+                        elif link_type in ('direct_video', 'direct_episodes', 'video'):
+                            cached = get_cached_fetch("sources:" + selected_anime_url)
+                            items_data = cached.get("items_data", []) if cached else []
+                            direct_eps = [(l, h) for l, h, t in items_data if t in ('direct_video', 'direct_episodes', 'video')]
+                            if direct_eps:
+                                direct_eps.sort(key=lambda e: natural_sort_key(e[0]))
+                                selected_ep_idx = next((i for i, (l, u) in enumerate(direct_eps) if u == selected_url), 0)
+                                result = {"type": "direct_episodes", "episodes": direct_eps, "selected": selected_ep_idx, "hist_ctx": hist_ctx}
+                            else:
+                                result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
                         elif link_type == 'worker_folder':
                             result = {"type": "worker_folder", "url": selected_url, "hist_ctx": hist_ctx}
                         else:
@@ -1834,29 +1869,21 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
     while True:
         labels = [format_item_label(l, t) for l, u, t in link_data]
         res = fzf_select(labels, "Select source: ", default_idx=default_idx, header=header, footer=footer)
+        act, idx, raw = parse_fzf_result(res)
         if res is None:
             break
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+        if act == "main_menu":
             return "main_menu"
-        if isinstance(res, tuple):
-            act, idx = res[:2]
-            if idx is not None and 0 <= idx < len(link_data):
-                default_idx = idx
-            if act == "main_menu":
-                return "main_menu"
-            elif act == "delete":
+        if idx is not None and 0 <= idx < len(link_data):
+            default_idx = idx
+            if act == "delete":
                 delete_history_entry(clean_title)
                 return "main_menu"
             elif act == "toggle_watched":
                 toggle_watched_entry(clean_title)
                 continue
-            idx = default_idx
-        else:
-            idx = res
-            default_idx = idx
-
-        if idx is not None and 0 <= idx < len(link_data):
-            label, selected_url, link_type = link_data[idx]
+            else:
+                label, selected_url, link_type = link_data[idx]
             stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
             hist_ctx = HistoryContext(
                 title=clean_title,
@@ -1959,32 +1986,26 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
             header_with_stats = build_header(display_stack, count_items_summary(entries))
             labels = [format_item_label(l, t, is_watched=(l in watched)) for l, _, t in entries]
             res = fzf_select(labels, "Select: ", default_idx=first_unwatched_idx, header=header_with_stats, footer=footer)
+            act, idx, raw = parse_fzf_result(res)
             if res is None:
                 if folder_stack:
                     current_url = folder_stack.pop()
                     if len(display_stack) > 2: display_stack.pop()
                     continue
                 return True
-            if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+            if act == "main_menu":
                 return "main_menu"
-            if isinstance(res, tuple):
-                act, idx = res[:2]
-                if act == "main_menu":
-                    return "main_menu"
-                elif act == "toggle_watched":
-                    if hist_ctx and idx is not None and 0 <= idx < len(entries):
-                        toggle_watched_entry(hist_ctx.title, entries[idx][0])
-                        first_unwatched_idx = min(idx + 1, len(entries) - 1)
-                    continue
-                elif act == "delete":
-                    if hist_ctx:
-                        delete_history_entry(hist_ctx.title)
-                    return "main_menu"
-                idx = idx
-            else:
-                idx = res
             if idx is None or not (0 <= idx < len(entries)):
                 continue
+            if act == "toggle_watched":
+                if hist_ctx:
+                    toggle_watched_entry(hist_ctx.title, entries[idx][0])
+                    first_unwatched_idx = min(idx + 1, len(entries) - 1)
+                continue
+            elif act == "delete":
+                if hist_ctx:
+                    delete_history_entry(hist_ctx.title)
+                return "main_menu"
             label, selected_url, link_type = entries[idx]
 
         if hist_ctx:
@@ -2033,23 +2054,23 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
     idx = selected_idx if (selected_idx is not None and 0 <= selected_idx < len(episodes)) else (first_unwatched_idx if first_unwatched_idx is not None else 0)
 
     if resume:
-        res = _select_ep_prompt(idx)
-        if res is None:
-            return True
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-            return "main_menu"
-        if isinstance(res, tuple):
-            act, sel_idx = res[:2]
-            if sel_idx is not None and 0 <= sel_idx < len(episodes): idx = sel_idx
-            if act == "main_menu": return "main_menu"
-            elif act == "toggle_watched":
+        while True:
+            res = _select_ep_prompt(idx)
+            act, sel_idx, raw = parse_fzf_result(res)
+            if res is None:
+                return True
+            if act == "main_menu":
+                return "main_menu"
+            if sel_idx is not None and 0 <= sel_idx < len(episodes):
+                idx = sel_idx
+            if act == "toggle_watched":
                 if hist_ctx: toggle_watched_entry(hist_ctx.title, episodes[idx][0])
                 idx = min(idx + 1, len(episodes) - 1)
+                continue
             elif act == "delete":
                 if hist_ctx: delete_history_entry(hist_ctx.title)
                 return "main_menu"
-        elif isinstance(res, int):
-            idx = res
+            break
 
     while True:
         label, url = episodes[idx]
@@ -2073,22 +2094,22 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
         elif act == 1 or act == "replay": pass
         elif act == 2 or act == "previous": idx = max(idx - 1, 0)
         elif act == 3 or act == "select":
-            res = _select_ep_prompt(idx)
-            if res is None: return True
-            if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-                return "main_menu"
-            if isinstance(res, tuple):
-                a_type, sel_idx = res[:2]
-                if sel_idx is not None and 0 <= sel_idx < len(episodes): idx = sel_idx
-                if a_type == "main_menu": return "main_menu"
-                elif a_type == "toggle_watched":
+            while True:
+                res = _select_ep_prompt(idx)
+                act_sel, sel_idx, raw = parse_fzf_result(res)
+                if res is None: break
+                if act_sel == "main_menu":
+                    return "main_menu"
+                if sel_idx is not None and 0 <= sel_idx < len(episodes):
+                    idx = sel_idx
+                if act_sel == "toggle_watched":
                     if hist_ctx: toggle_watched_entry(hist_ctx.title, episodes[idx][0])
                     idx = min(idx + 1, len(episodes) - 1)
-                elif a_type == "delete":
+                    continue
+                elif act_sel == "delete":
                     if hist_ctx: delete_history_entry(hist_ctx.title)
                     return "main_menu"
-            elif isinstance(res, int):
-                idx = res
+                break
         else: return True
     return True
 
@@ -2182,6 +2203,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                 header_with_stats = build_header(display_stack, count_items_summary(files))
                 watched = get_watched_list(hist_ctx)
                 res = fzf_select([format_cloud_file_label(f, is_watched=(f.name in watched)) for f in files], "Select file: ", header=header_with_stats, footer=footer)
+                act, idx, raw = parse_fzf_result(res)
                 if res is None:
                     if folder_stack:
                         current_folder_url = folder_stack.pop()
@@ -2189,14 +2211,11 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                             display_stack.pop()
                         continue
                     return True
-                if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+                if act == "main_menu":
                     return "main_menu"
-                if isinstance(res, tuple):
-                    act, idx = res[:2]
-                    if act == "main_menu":
-                        return "main_menu"
-                    elif act == "toggle_watched":
-                        if hist_ctx and idx is not None and 0 <= idx < len(files):
+                if idx is not None and 0 <= idx < len(files):
+                    if act == "toggle_watched":
+                        if hist_ctx:
                             toggle_watched_entry(hist_ctx.title, files[idx].name)
                             first_unwatched_idx = min(idx + 1, len(files) - 1)
                         continue
@@ -2204,9 +2223,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                         if hist_ctx:
                             delete_history_entry(hist_ctx.title)
                         return "main_menu"
-                else:
-                    if 0 <= res < len(files):
-                        selected_file = files[res]
+                    selected_file = files[idx]
 
         if hist_ctx and selected_file:
             save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
@@ -2293,6 +2310,7 @@ def resume_history(title, entry, download_mode=False):
         tags=entry.get("tags", "")
     )
 
+    res = None
     if source_type == "cloud":
         res = play_and_browse(
             selected_file=None,
@@ -2302,29 +2320,23 @@ def resume_history(title, entry, download_mode=False):
             hist_ctx=hist_ctx,
             resume_from=entry
         )
-        if res == "main_menu": return "main_menu"
+    elif source_type == "direct_episodes":
         if anime_url:
             return anime_download_link(anime_url, download_mode=download_mode)
-
-    elif source_type == "direct_episodes":
         episodes = entry.get("episodes", [])
         selected_idx = entry.get("selected_idx", 0)
         if episodes:
             res = play_direct_episodes(episodes, selected_idx, download_mode=download_mode, hist_ctx=hist_ctx, resume=True)
-            if res == "main_menu": return "main_menu"
-        if anime_url:
-            return anime_download_link(anime_url, download_mode=download_mode)
-
     elif source_type == "worker_folder":
         url = entry.get("current_folder_url") or entry.get("source_url")
         if url:
             res = browse_worker_folder(url, download_mode=download_mode, hist_ctx=hist_ctx, resume_from=entry)
-            if res == "main_menu": return "main_menu"
-        if anime_url:
-            return anime_download_link(anime_url, download_mode=download_mode)
-    else:
-        if anime_url:
-            return anime_download_link(anime_url, download_mode=download_mode)
+
+    if res == "main_menu":
+        return "main_menu"
+    elif anime_url:
+        return anime_download_link(anime_url, download_mode=download_mode)
+    return True
 
 def search(query, download_mode=False):
     anime_search_url = search_url + query
@@ -2343,7 +2355,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
     parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history (and exit)")
-    parser.add_argument("--version", action="version", version="animetoki-cli 2.4")
+    parser.add_argument("--version", action="version", version="animetoki-cli 2.5")
     parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -2381,26 +2393,24 @@ def main():
                     display_titles = [format_history_label(t, hist.get(t)) for t in titles]
                     footer = build_footer([("Enter", "Resume"), ("Ctrl+D", "Delete"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
                     res = fzf_select(display_titles, "Select history: ", header="AnimeToki CLI | Watch History", footer=footer)
-                    if res is None or res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+                    act, idx, raw = parse_fzf_result(res)
+                    if res is None or act == "main_menu":
                         args.continue_watch = False
                         continue
-                    if isinstance(res, tuple):
-                        act, idx = res[:2]
-                        if idx is not None and 0 <= idx < len(titles):
-                            sel_title = titles[idx]
-                            if act == "delete":
-                                delete_history_entry(sel_title)
-                                continue
-                            elif act == "toggle_watched":
-                                toggle_watched_entry(sel_title)
-                                continue
-                    elif isinstance(res, int):
-                        selected_title = titles[res]
-                        entry = hist[selected_title]
-                        r = resume_history(selected_title, entry, args.download)
-                        if r == "main_menu":
-                            args.continue_watch = False
+                    if idx is not None and 0 <= idx < len(titles):
+                        sel_title = titles[idx]
+                        if act == "delete":
+                            delete_history_entry(sel_title)
                             continue
+                        elif act == "toggle_watched":
+                            toggle_watched_entry(sel_title)
+                            continue
+                        else:
+                            entry = hist[sel_title]
+                            r = resume_history(sel_title, entry, args.download)
+                            if r == "main_menu":
+                                args.continue_watch = False
+                                continue
                 args.continue_watch = False
                 continue
 

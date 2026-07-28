@@ -1,6 +1,6 @@
 [project]
 name = "animetoki-cli"
-version = "2.4"
+version = "2.5"
 dependencies = [
     "curl_cffi", 
     "beautifulsoup4"
