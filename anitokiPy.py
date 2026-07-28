@@ -1,71 +1,51 @@
-import json
-import socket
-import base64
-import subprocess
-import argparse
 import sys
+import json
+import os
 import shutil
-import signal
 import time
 import re
-import os
-import logging
+import base64
+import socket
+import subprocess
+import argparse
+import signal
 import threading
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-import urllib.request
 from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
+
 try:
     import termios
 except ImportError:
     termios = None
 
-log_dir = Path.home() / ".local" / "share" / "anitokipy"
-log_dir.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(log_dir / "anitokipy.log"),
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("anitokipy")
-
-CONFIG_PATH = Path.home() / ".config" / "anitokipy" / "config.json"
-
-def load_config():
-    defaults = {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "mpv_flags": [
-            "--cache=yes",
-            "--demuxer-max-bytes=200MiB",
-            "--save-position-on-quit",
-            "--fullscreen"
-        ],
-        "download_dir": "."
-    }
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                user_conf = json.load(f)
-                if isinstance(user_conf, dict):
-                    defaults.update(user_conf)
-        except Exception as e:
-            logger.debug(f"Failed to load config file: {e}")
-    return defaults
-
-CONFIG = load_config()
-UA = CONFIG["user_agent"]
-
-def is_termux():
-    return os.environ.get('TERMUX_VERSION') is not None or os.path.isdir('/data/data/com.termux')
-
 base_url = "https://animetoki.com"
 search_url = "https://animetoki.com/?s="
 
-session = None
 hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
 COOKIE_PATH = Path.home() / ".local" / "state" / "anitokipy" / "cookies.json"
 CACHE_FILE = Path.home() / ".local" / "state" / "anitokipy" / "cache.json"
+
+session = None
+
+@dataclass
+class CloudFile:
+    name: str
+    id: str
+    mime_type: str
+    node_index: str
+    size: int = 0
+
+@dataclass
+class HistoryContext:
+    title: str
+    anime_url: str
+    source_label: str = ""
+    source_type: str = ""
+    source_url: str = ""
+    raw_title: str = ""
+    tags: str = ""
 
 def load_fetch_cache():
     if not CACHE_FILE.exists():
@@ -118,8 +98,8 @@ def save_cookies():
         with open(tmp_file, "w") as f:
             json.dump(cookies_data, f)
         tmp_file.replace(COOKIE_PATH)
-    except Exception as e:
-        logger.debug(f"Failed to save cookies: {e}")
+    except Exception:
+        pass
 
 def load_cookies():
     if not session or not COOKIE_PATH.exists():
@@ -134,8 +114,8 @@ def load_cookies():
                     if c.get("domain"): kwargs["domain"] = c["domain"]
                     if c.get("path"): kwargs["path"] = c["path"]
                     session.cookies.set(c["name"], c["value"], **kwargs)
-    except Exception as e:
-        logger.debug(f"Failed to load cookies: {e}")
+    except Exception:
+        pass
 
 def _cookie_header():
     if not session or not hasattr(session, "cookies"):
@@ -147,32 +127,202 @@ def _cookie_header():
     except Exception:
         return ""
 
+def init_session(force_refresh=False):
+    global session
+    if session is not None and not force_refresh:
+        return
+    from curl_cffi import requests as cffi_requests
+    session = cffi_requests.Session(impersonate="firefox133")
+    if not force_refresh:
+        load_cookies()
+    try:
+        session.get("https://animetoki.com", timeout=4)
+        session.get("https://cloud.animetoki.com", timeout=4)
+        session.get("https://drive.animetoki.com", timeout=4)
+        save_cookies()
+    except Exception:
+        pass
+
+def safe_request(method, url, max_retries=3, timeout=4, **kwargs):
+    global session
+    if session is None:
+        init_session()
+    for attempt in range(max_retries):
+        try:
+            resp = getattr(session, method)(url, impersonate="firefox133", timeout=timeout, **kwargs)
+            if resp.status_code == 403 or (resp.text and "Session Expired" in resp.text):
+                init_session(force_refresh=True)
+                resp = getattr(session, method)(url, impersonate="firefox133", timeout=timeout, **kwargs)
+            resp.raise_for_status()
+            save_cookies()
+            return resp
+        except Exception as e:
+            if 'logger' in globals() and logger and logger.handlers:
+                logger.debug(f"Request failed ({method} {url}, attempt {attempt+1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(0.5)
+    return None
+
+def is_base64_segment(s: str) -> bool:
+    if not s:
+        return False
+    if re.search(r"[%\s\[\]\(\)\\]", s):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/=_~-]+", s):
+        return False
+    try:
+        padded = s + "=" * (-len(s) % 4)
+        decoded_bytes = base64.b64decode(padded.encode("ascii"))
+        decoded_str = decoded_bytes.decode("utf-8")
+        return all(ord(c) >= 32 or c in "\n\r\t" for c in decoded_str)
+    except Exception:
+        return False
+
+def encode_cloud_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "cloud.animetoki.com" not in parsed.netloc and "drive.animetoki.com" not in parsed.netloc:
+        return url
+        
+    domain_url = f"https://{parsed.netloc}/"
+    segments = []
+    for s in parsed.path.split("/"):
+        if not s:
+            continue
+        unquoted = unquote(s)
+        if is_base64_segment(unquoted):
+            segments.append(unquoted)
+        else:
+            encoded_seg = base64.b64encode(unquoted.encode("utf-8")).decode("utf-8")
+            segments.append(encoded_seg)
+            
+    return domain_url + "/".join(segments) + "/" if segments else domain_url
+
 def natural_sort_key(s):
     s_norm = re.sub(r'[^\w\s]', ' ', s.lower())
     s_norm = re.sub(r'\s+', ' ', s_norm).strip()
     return [int(text) if text.isdigit() else text for text in re.split('([0-9]+)', s_norm)]
 
-@dataclass
-class CloudFile:
-    name: str
-    id: str
-    mime_type: str
-    node_index: str
-    size: int = 0
-
-@dataclass
-class HistoryContext:
-    title: str
-    anime_url: str
-    source_label: str = ""
-    source_type: str = ""
-    source_url: str = ""
-    raw_title: str = ""
-    tags: str = ""
-
 def is_raw_release_title(t: str) -> bool:
-    """Check if title string contains raw release details (resolution, dual audio, etc.)."""
     return bool(re.search(r'\bDual Audio\b|\bSubbed\b|\b1080p\b|\b720p\b|\[.*?\]|Season \d+', str(t), re.I))
+
+def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
+    working = str(raw_title).strip()
+    working = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', working, flags=re.IGNORECASE).strip()
+
+    brackets = re.findall(r'\[(.*?)\]', working)
+    res_tag = ''
+    for b in brackets:
+        res_matches = re.findall(r'\d{3,4}p|\b4K\b', b, re.I)
+        if res_matches:
+            if len(res_matches) > 1:
+                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
+            else:
+                res_tag = res_matches[0]
+
+    working = re.sub(r'\[.*?\]', '', working).strip()
+
+    audio_tag = ''
+    audio_patterns = [
+        (r'\bDual Audio\b|\bDual\b', 'Dual'),
+        (r'\bTri Audio\b|\bTri\b', 'Tri'),
+        (r'\bMulti Audio\b|\bMulti\b', 'Multi'),
+        (r'\bEnglish Subbed\b|\bSubbed\b', 'Sub'),
+        (r'\bEnglish Dubbed\b|\bDubbed\b', 'Dub')
+    ]
+    for pat, val in audio_patterns:
+        if re.search(pat, working, re.I):
+            audio_tag = val
+            working = re.sub(pat, '', working, flags=re.I).strip()
+            break
+
+    codec_tags = []
+    for codec in ['HEVC', 'AV1', 'BD', '10bit']:
+        if re.search(r'\b' + codec + r'\b', working, re.I):
+            codec_tags.append(codec.upper())
+            working = re.sub(r'\b' + codec + r'\b', '', working, flags=re.I).strip()
+
+    p_match = re.search(r'\((.*?)\)', working)
+    generic_tags = []
+    named_subtitles = []
+    has_seasons = False
+
+    base_title = working
+    if p_match:
+        p_content = p_match.group(1)
+        base_title = working[:p_match.start()].strip()
+
+        items = [i.strip() for i in re.split(r'\+|\bamp\b|,', p_content)]
+
+        for item in items:
+            rem_item = item
+
+            m_s = re.search(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', rem_item, re.I)
+            if m_s:
+                has_seasons = True
+                s1 = int(m_s.group(1))
+                s2 = int(m_s.group(2)) if m_s.group(2) else None
+                generic_tags.append(f'S{s1}-S{s2}' if s2 else f'S{s1}')
+                rem_item = re.sub(r'Seasons?\s*\d+(?:\s*[-+to\s]+\s*\d+)?', '', rem_item, flags=re.I).strip()
+            elif re.search(r'All Seasons?', rem_item, re.I):
+                has_seasons = True
+                generic_tags.append('Seasons')
+                rem_item = re.sub(r'All Seasons?', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Final Season', rem_item, re.I):
+                has_seasons = True
+                generic_tags.append('Final')
+                rem_item = re.sub(r'Final Season', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'\bMovies?\b|\bThe Movie\b', rem_item, re.I):
+                if 'M' not in generic_tags: generic_tags.append('M')
+                rem_item = re.sub(r'\bMovies?\b|\bThe Movie\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'\bOVAs?\b|\bOAV\b', rem_item, re.I):
+                if 'OVA' not in generic_tags: generic_tags.append('OVA')
+                rem_item = re.sub(r'\bOVAs?\b|\bOAV\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'\bSpecials?\b|\bShorts\b', rem_item, re.I):
+                if 'SP' not in generic_tags: generic_tags.append('SP')
+                rem_item = re.sub(r'\bSpecials?\b|\bShorts\b', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Complete Series|Complete Movies Series|Complete', rem_item, re.I):
+                if 'Complete' not in generic_tags: generic_tags.append('Complete')
+                rem_item = re.sub(r'Complete Series|Complete Movies Series|Complete', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'Directors Cut|DC', rem_item, re.I):
+                if 'DC' not in generic_tags: generic_tags.append('DC')
+                rem_item = re.sub(r'Directors Cut|DC', '', rem_item, flags=re.I).strip()
+
+            if re.search(r'OST', rem_item, re.I):
+                if 'OST' not in generic_tags: generic_tags.append('OST')
+                rem_item = re.sub(r'OST', '', rem_item, flags=re.I).strip()
+
+            rem_item = re.sub(r'^\W+|\W+$', '', rem_item)
+            if rem_item:
+                named_subtitles.append(rem_item)
+
+    base_title = re.sub(r'\bComplete Series\b|\bComplete\b', '', base_title, flags=re.I).strip()
+    base_title = re.sub(r'\s+', ' ', base_title).strip(' -:')
+
+    clean_title = base_title
+    if named_subtitles:
+        prefix = '+ ' if (has_seasons or 'Complete' in generic_tags or 'M' in generic_tags) else ''
+        clean_title += f' ({prefix}{" + ".join(named_subtitles)})'
+
+    path_dir = f'/{base_title}'
+
+    all_tags = []
+    if audio_tag: all_tags.append(audio_tag)
+    for gt in generic_tags:
+        if gt not in all_tags: all_tags.append(gt)
+    for ct in codec_tags:
+        if ct not in all_tags: all_tags.append(ct)
+    if res_tag: all_tags.append(res_tag)
+
+    tags_str = '.'.join(all_tags)
+
+    return clean_title, path_dir, tags_str
 
 def save_history_entry(title, payload):
     hist_file.parent.mkdir(parents=True, exist_ok=True)
@@ -180,8 +330,7 @@ def save_history_entry(title, payload):
         if hist_file.exists():
             with open(hist_file, "r") as f: hist = json.load(f)
         else: hist = {}
-    except Exception as e:
-        logger.debug(f"Error reading history file: {e}")
+    except Exception:
         hist = {}
     if not isinstance(hist, dict): hist = {}
 
@@ -252,9 +401,8 @@ def save_history_entry(title, payload):
     try:
         with open(tmp_file, "w") as f: json.dump(hist, f, indent=2)
         tmp_file.replace(hist_file)
-        logger.debug(f"Saved history entry for '{clean_t}'")
-    except Exception as e:
-        logger.error(f"Failed to save history: {e}")
+    except Exception:
+        pass
 
 def load_history():
     if not hist_file.exists():
@@ -322,12 +470,11 @@ def load_history():
                 reverse=True
             )
             return dict(sorted_entries)
-    except Exception as e:
-        logger.debug(f"Failed to load history: {e}")
+    except Exception:
+        pass
     return {}
 
 def delete_history_entry(title):
-    """Deletes an entry from history state file by clean title or key."""
     if not hist_file.exists():
         return False
     try:
@@ -345,14 +492,12 @@ def delete_history_entry(title):
             with open(tmp_file, "w") as f:
                 json.dump(hist, f, indent=2)
             tmp_file.replace(hist_file)
-            logger.debug(f"Deleted history entry for '{title}'")
             return True
-    except Exception as e:
-        logger.error(f"Failed to delete history entry: {e}")
+    except Exception:
+        pass
     return False
 
 def toggle_watched_entry(title, item_name=None):
-    """Toggle watched state of item_name (or last played episode) under history title."""
     hist = load_history()
     if not hist or not title:
         return
@@ -482,6 +627,26 @@ def save_worker_history(hist_ctx, current_url, folder_stack, selected_name, disp
     }
     save_history_entry(hist_ctx.title, payload)
 
+def classify_link(url):
+    video_exts = ('.mkv', '.mp4', '.avi', '.webm')
+    parsed = urlparse(url)
+    path_lower = parsed.path.lower()
+    query_lower = parsed.query.lower()
+    
+    if 'cloud.animetoki.com' in parsed.netloc or 'drive.animetoki.com' in parsed.netloc:
+        return 'cloud'
+    
+    for ext in video_exts:
+        if path_lower.endswith(ext) or f'{ext}?' in path_lower or f'{ext}?' in url.lower():
+            return 'direct_video'
+    if 'a=view' in query_lower:
+        return 'direct_video'
+    
+    if parsed.path.endswith('/'):
+        return 'worker_folder'
+    
+    return 'unknown'
+
 def format_bytes(size):
     if not size:
         return ""
@@ -495,133 +660,6 @@ def format_bytes(size):
     except Exception:
         return ""
 
-def truncate_middle(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    if max_len <= 3:
-        return text[:max_len]
-    half = (max_len - 2) // 2
-    remainder = max_len - 2 - half
-    return text[:half] + ".." + text[-remainder:]
-
-def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
-    working = raw_title.strip()
-    working = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', working, flags=re.IGNORECASE).strip()
-
-    brackets = re.findall(r'\[(.*?)\]', working)
-    res_tag = ''
-    for b in brackets:
-        res_matches = re.findall(r'\d{3,4}p|\b4K\b', b, re.I)
-        if res_matches:
-            if len(res_matches) > 1:
-                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
-            else:
-                res_tag = res_matches[0]
-
-    working = re.sub(r'\[.*?\]', '', working).strip()
-
-    audio_tag = ''
-    audio_patterns = [
-        (r'\bDual Audio\b|\bDual\b', 'Dual'),
-        (r'\bTri Audio\b|\bTri\b', 'Tri'),
-        (r'\bMulti Audio\b|\bMulti\b', 'Multi'),
-        (r'\bEnglish Subbed\b|\bSubbed\b', 'Sub'),
-        (r'\bEnglish Dubbed\b|\bDubbed\b', 'Dub')
-    ]
-    for pat, val in audio_patterns:
-        if re.search(pat, working, re.I):
-            audio_tag = val
-            working = re.sub(pat, '', working, flags=re.I).strip()
-            break
-
-    codec_tags = []
-    for codec in ['HEVC', 'AV1', 'BD', '10bit']:
-        if re.search(r'\b' + codec + r'\b', working, re.I):
-            codec_tags.append(codec.upper())
-            working = re.sub(r'\b' + codec + r'\b', '', working, flags=re.I).strip()
-
-    p_match = re.search(r'\((.*?)\)', working)
-    generic_tags = []
-    named_subtitles = []
-    has_seasons = False
-
-    base_title = working
-    if p_match:
-        p_content = p_match.group(1)
-        base_title = working[:p_match.start()].strip()
-
-        items = [i.strip() for i in re.split(r'\+|\bamp\b|,', p_content)]
-
-        for item in items:
-            rem_item = item
-
-            m_s = re.search(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', rem_item, re.I)
-            if m_s:
-                has_seasons = True
-                s1 = int(m_s.group(1))
-                s2 = int(m_s.group(2)) if m_s.group(2) else None
-                generic_tags.append(f'S{s1}-S{s2}' if s2 else f'S{s1}')
-                rem_item = re.sub(r'Seasons?\s*\d+(?:\s*[-+to\s]+\s*\d+)?', '', rem_item, flags=re.I).strip()
-            elif re.search(r'All Seasons?', rem_item, re.I):
-                has_seasons = True
-                generic_tags.append('Seasons')
-                rem_item = re.sub(r'All Seasons?', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'Final Season', rem_item, re.I):
-                has_seasons = True
-                generic_tags.append('Final')
-                rem_item = re.sub(r'Final Season', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'\bMovies?\b|\bThe Movie\b', rem_item, re.I):
-                if 'M' not in generic_tags: generic_tags.append('M')
-                rem_item = re.sub(r'\bMovies?\b|\bThe Movie\b', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'\bOVAs?\b|\bOAV\b', rem_item, re.I):
-                if 'OVA' not in generic_tags: generic_tags.append('OVA')
-                rem_item = re.sub(r'\bOVAs?\b|\bOAV\b', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'\bSpecials?\b|\bShorts\b', rem_item, re.I):
-                if 'SP' not in generic_tags: generic_tags.append('SP')
-                rem_item = re.sub(r'\bSpecials?\b|\bShorts\b', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'Complete Series|Complete Movies Series|Complete', rem_item, re.I):
-                if 'Complete' not in generic_tags: generic_tags.append('Complete')
-                rem_item = re.sub(r'Complete Series|Complete Movies Series|Complete', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'Directors Cut|DC', rem_item, re.I):
-                if 'DC' not in generic_tags: generic_tags.append('DC')
-                rem_item = re.sub(r'Directors Cut|DC', '', rem_item, flags=re.I).strip()
-
-            if re.search(r'OST', rem_item, re.I):
-                if 'OST' not in generic_tags: generic_tags.append('OST')
-                rem_item = re.sub(r'OST', '', rem_item, flags=re.I).strip()
-
-            rem_item = re.sub(r'^\W+|\W+$', '', rem_item)
-            if rem_item:
-                named_subtitles.append(rem_item)
-
-    base_title = re.sub(r'\bComplete Series\b|\bComplete\b', '', base_title, flags=re.I).strip()
-    base_title = re.sub(r'\s+', ' ', base_title).strip(' -:')
-
-    clean_title = base_title
-    if named_subtitles:
-        prefix = '+ ' if (has_seasons or 'Complete' in generic_tags or 'M' in generic_tags) else ''
-        clean_title += f' ({prefix}{" + ".join(named_subtitles)})'
-
-    path_dir = f'/{base_title}'
-
-    all_tags = []
-    if audio_tag: all_tags.append(audio_tag)
-    for gt in generic_tags:
-        if gt not in all_tags: all_tags.append(gt)
-    for ct in codec_tags:
-        if ct not in all_tags: all_tags.append(ct)
-    if res_tag: all_tags.append(res_tag)
-
-    tags_str = '.'.join(all_tags)
-
-    return clean_title, path_dir, tags_str
-
 def format_anime_title_label(raw_title: str) -> str:
     clean_title, path_dir, tags_str = parse_anime_title(raw_title)
     if not tags_str:
@@ -631,6 +669,326 @@ def format_anime_title_label(raw_title: str) -> str:
     pad_count = max(2, avail_width - len(clean_title) - len(tags_str))
     spaces = " " * pad_count
     return f"{clean_title}{spaces}\033[90m{tags_str}\033[0m"
+
+def format_item_label(name: str, item_type: str, size_str: str = "", is_watched: bool = False) -> str:
+    is_folder = item_type in ('folder', 'worker_folder', 'cloud')
+    clean_name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE).strip()
+
+    res_tag = ''
+    if not is_folder:
+        clean_name = re.sub(r'\.(?:mkv|mp4|avi|webm)$', '', clean_name, flags=re.IGNORECASE).strip()
+
+        res_matches = re.findall(r'\b\d{3,4}p\b|\b4K\b', clean_name, flags=re.IGNORECASE)
+        if res_matches:
+            if len(res_matches) > 1:
+                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
+            else:
+                res_tag = res_matches[0]
+                
+        clean_name = re.sub(r'\[\s*(?:\d{3,4}p|4K)\b[^\]]*\]', '', clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r'\(\s*(?:\d{3,4}p|4K)\b[^\)]*\)', '', clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r'\b(?:\d{3,4}p|4K)\b', '', clean_name, flags=re.IGNORECASE)
+
+        tag_words = r'HEVC|HVEC|x265|x264|AVC|10bit|8bit|Dual[- ]Audio|Tri[- ]Audio|Multi[- ]Audio|Multi[- ]Subs?|Eng[- ]Subs?|Softsubs?|Hardsubs?|Subbed|Dubbed|BD|BDRip|WEBRip|WEB-DL|AAC|OPUS|FLAC|AC3'
+        clean_name = re.sub(rf'\[\s*(?:{tag_words})\b[^\]]*\]', '', clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(rf'\(\s*(?:{tag_words})\b[^\)]*\)', '', clean_name, flags=re.IGNORECASE)
+
+        clean_name = re.sub(r'\[\s*\]|\(\s*\)', '', clean_name)
+        clean_name = re.sub(r'\s+', ' ', clean_name).strip(' .-_')
+
+    right_parts = []
+    if res_tag and not is_folder:
+        right_parts.append(res_tag)
+    if size_str:
+        plain_size = size_str.strip('()')
+        if plain_size:
+            right_parts.append(plain_size)
+
+    right_str = '  '.join(right_parts)
+
+    cols, _ = shutil.get_terminal_size((80, 24))
+    avail_width = max(30, cols - 8)
+
+    if is_folder:
+        left_plain = f"🗁  {clean_name}"
+        left_ansi = f"\033[1;38;5;215m🗁  {clean_name}\033[0m"
+    elif is_watched:
+        left_plain = f"✓  {clean_name}"
+        left_ansi = f"\033[90m✓  {clean_name}\033[0m"
+    elif item_type in ('video', 'direct_video', 'file'):
+        left_plain = f"▶  {clean_name}"
+        left_ansi = f"\033[1;37m▶  {clean_name}\033[0m"
+    else:
+        left_plain = f"   {clean_name}"
+        left_ansi = f"\033[0m   {clean_name}"
+
+    if right_str:
+        pad_count = max(2, avail_width - len(left_plain) - len(right_str))
+        spaces = " " * pad_count
+        return f"{left_ansi}{spaces}\033[90m{right_str}\033[0m"
+    else:
+        return left_ansi
+
+def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
+    mime = cf.mime_type.lower() if cf.mime_type else ''
+    s_str = format_bytes(cf.size) if cf.size else ""
+    if 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder':
+        return format_item_label(cf.name, 'folder', is_watched=is_watched)
+    elif 'video' in mime:
+        return format_item_label(cf.name, 'video', size_str=s_str, is_watched=is_watched)
+    else:
+        return format_item_label(cf.name, 'file', size_str=s_str, is_watched=is_watched)
+
+def fetch_content(url):
+    url = encode_cloud_url(url)
+    cached = get_cached_fetch("cloud:" + url)
+    if cached:
+        files_data = cached.get("files", [])
+        node_idx = cached.get("node_index", "")
+        files = [CloudFile(**x) for x in files_data]
+        return files, node_idx
+
+    post_response = safe_request('post', url)
+    if not post_response:
+        return None, None
+        
+    try:
+        dict_json_ = post_response.json()
+    except Exception:
+        return None, None
+        
+    initial_file_list = dict_json_.get("files")
+    if not initial_file_list:
+        return None, None
+        
+    initial_node_index = str(dict_json_.get("node_index", ""))
+    initial_file_list.sort(key=lambda item: natural_sort_key(item.get("name", "")))
+    
+    files_data = [
+        {
+            "name": x.get("name", ""),
+            "id": x.get("id", ""),
+            "mime_type": x.get("mimeType", ""),
+            "node_index": initial_node_index,
+            "size": int(x.get("size", 0) or 0)
+        }
+        for x in initial_file_list
+    ]
+    set_cached_fetch("cloud:" + url, {"files": files_data, "node_index": initial_node_index})
+    files = [CloudFile(**x) for x in files_data]
+    return files, initial_node_index
+
+def fetch_worker_folder(url):
+    cached = get_cached_fetch("worker:" + url)
+    if cached:
+        return [tuple(x) for x in cached]
+
+    res = safe_request('get', url)
+    if not res:
+        return None
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(res.content, 'html.parser')
+    
+    folder_parsed = urlparse(url)
+    folder_domain = folder_parsed.netloc
+    folder_path = folder_parsed.path
+    
+    entries = []
+    for a in soup.select('a[href]'):
+        href = a.get('href', '')
+        if not href or href in ('.', '..', '../'):
+            continue
+        full_url = urljoin(url, href)
+        link_parsed = urlparse(full_url)
+        if link_parsed.netloc != folder_domain:
+            continue
+        if not link_parsed.path.startswith(folder_path.split('/0:/')[0]):
+            continue
+        label = a.get_text(strip=True) or unquote(link_parsed.path.split('/')[-1] or link_parsed.path.split('/')[-2])
+        link_type = classify_link(full_url)
+        entries.append((label, full_url, link_type))
+    
+    if not entries:
+        return None
+    
+    entries.sort(key=lambda e: natural_sort_key(e[0]))
+    set_cached_fetch("worker:" + url, entries)
+    return entries
+
+def run_internal_fetch(args):
+    if not args:
+        sys.exit(1)
+    action = args[0]
+    action_args = list(args[1:])
+    
+    toggle_item = None
+    if "--toggle" in action_args:
+        t_idx = action_args.index("--toggle")
+        if t_idx + 1 < len(action_args):
+            toggle_item = action_args[t_idx + 1]
+        action_args = action_args[:t_idx]
+
+    try:
+        if action == "toggle_watched":
+            anime_title = action_args[0] if len(action_args) > 0 else ""
+            item_name = action_args[1] if len(action_args) > 1 else ""
+            if anime_title and item_name:
+                toggle_watched_entry(anime_title, item_name)
+            sys.exit(0)
+
+        elif action == "cloud_folder":
+            url = encode_cloud_url(action_args[0])
+            anime_title = action_args[1] if len(action_args) > 1 else ""
+            if toggle_item and anime_title:
+                toggle_watched_entry(anime_title, toggle_item)
+            watched = get_watched_list(anime_title)
+            cached = get_cached_fetch("cloud:" + url)
+            if cached:
+                files_data = cached.get("files", [])
+                files = [CloudFile(**x) for x in files_data]
+            else:
+                init_session()
+                files, _ = fetch_content(url)
+            if not files:
+                print("ERROR: No files found in cloud folder.")
+                sys.exit(1)
+            for i, cf in enumerate(files):
+                lbl = format_cloud_file_label(cf, is_watched=(cf.name in watched))
+                print(f"{i}\t{lbl}\t{cf.name}\t{cf.id}\t{cf.mime_type}\t{cf.node_index}\t{cf.size}")
+            sys.exit(0)
+
+        elif action == "worker_folder":
+            url = action_args[0]
+            anime_title = action_args[1] if len(action_args) > 1 else ""
+            if toggle_item and anime_title:
+                toggle_watched_entry(anime_title, toggle_item)
+            watched = get_watched_list(anime_title)
+            cached = get_cached_fetch("worker:" + url)
+            if cached:
+                entries = [tuple(x) for x in cached]
+            else:
+                init_session()
+                entries = fetch_worker_folder(url)
+            if not entries:
+                print("ERROR: No entries found in worker folder.")
+                sys.exit(1)
+            for i, (label, full_url, link_type) in enumerate(entries):
+                lbl = format_item_label(label, link_type, is_watched=(label in watched))
+                print(f"{i}\t{lbl}\t{label}\t{full_url}\t{link_type}")
+            sys.exit(0)
+
+        elif action == "search":
+            init_session()
+            from bs4 import BeautifulSoup
+            query = " ".join(action_args)
+            cached = get_cached_fetch("search:" + query)
+            if cached:
+                raw_names, urls = cached["raw_names"], cached["urls"]
+            else:
+                res = safe_request('get', search_url + query)
+                if not res:
+                    print(f"ERROR: Failed to connect for query '{query}'")
+                    sys.exit(1)
+                soup = BeautifulSoup(res.content, 'html.parser')
+                anime_list = soup.select('.post-item-inner > a:first-child')
+                if not anime_list:
+                    print("ERROR: No results found.")
+                    sys.exit(1)
+                raw_names = [a.get('aria-label', 'Unknown') for a in anime_list]
+                urls = [urljoin(base_url, a['href']) for a in anime_list]
+                set_cached_fetch("search:" + query, {"raw_names": raw_names, "urls": urls})
+
+            for i, (name, url) in enumerate(zip(raw_names, urls)):
+                lbl = format_anime_title_label(name)
+                print(f"{i}\t{lbl}\t{url}\t{name}")
+            sys.exit(0)
+
+        elif action == "anime_sources":
+            init_session()
+            from bs4 import BeautifulSoup
+            selected_anime_url = action_args[0]
+            raw_title = action_args[1] if len(action_args) > 1 else ""
+            cached = get_cached_fetch("sources:" + selected_anime_url)
+            if cached:
+                items_data, best_raw = cached["items_data"], cached["best_raw"]
+            else:
+                res_anime = safe_request('get', selected_anime_url)
+                if not res_anime:
+                    print("ERROR: Failed to fetch anime details.")
+                    sys.exit(1)
+                soup = BeautifulSoup(res_anime.content, 'html.parser')
+                anime_title = soup.find('h1', class_="post-title entry-title")
+                page_raw_title = anime_title.get_text().strip() if anime_title else "Unknown"
+                best_raw = raw_title if (raw_title and is_raw_release_title(raw_title)) else (page_raw_title if is_raw_release_title(page_raw_title) else (raw_title if len(raw_title) > len(page_raw_title) else page_raw_title))
+
+                cloud_links = soup.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
+                cdn_links = [a for a in soup.select('a.shortc-button[href]') if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
+                all_links = list(cloud_links) + list(cdn_links)
+                if not all_links:
+                    print("ERROR: No streaming links found for this anime.")
+                    sys.exit(1)
+                items_data = []
+                for link in all_links:
+                    label = link.get_text(strip=True)
+                    href = urljoin(base_url, link['href'])
+                    link_type = classify_link(href)
+                    if link_type == 'cloud':
+                        href = encode_cloud_url(href)
+                    items_data.append((label, href, link_type))
+                set_cached_fetch("sources:" + selected_anime_url, {"items_data": items_data, "best_raw": best_raw})
+
+            for i, (label, href, link_type) in enumerate(items_data):
+                lbl = format_item_label(label, link_type)
+                print(f"{i}\t{lbl}\t{label}\t{href}\t{link_type}\t{best_raw}")
+            sys.exit(0)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+# FAST PATH ROUTING FOR INTERNAL FETCH (MUST BE BEFORE HEAVY INITS)
+if len(sys.argv) > 1 and sys.argv[1] == "--internal-fetch":
+    run_internal_fetch(sys.argv[2:])
+    sys.exit(0)
+
+# HEAVY INITIALIZATIONS ONLY RUN IN INTERACTIVE / MPV MODE
+import logging
+log_dir = Path.home() / ".local" / "share" / "anitokipy"
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(log_dir / "anitokipy.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("anitokipy")
+
+CONFIG_PATH = Path.home() / ".config" / "anitokipy" / "config.json"
+
+def load_config():
+    defaults = {
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "mpv_flags": [
+            "--cache=yes",
+            "--demuxer-max-bytes=200MiB",
+            "--save-position-on-quit",
+            "--fullscreen"
+        ],
+        "download_dir": "."
+    }
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                user_conf = json.load(f)
+                if isinstance(user_conf, dict):
+                    defaults.update(user_conf)
+        except Exception:
+            pass
+    return defaults
+
+CONFIG = load_config()
+UA = CONFIG["user_agent"]
+
+def is_termux():
+    return os.environ.get('TERMUX_VERSION') is not None or os.path.isdir('/data/data/com.termux')
 
 def format_history_label(title: str, entry: dict = None) -> str:
     raw = ""
@@ -732,69 +1090,14 @@ def count_items_summary(items_or_files):
         parts.append(f"{folders} {'Folder' if folders == 1 else 'Folders'}")
     return ", ".join(parts)
 
-def format_item_label(name: str, item_type: str, size_str: str = "", is_watched: bool = False) -> str:
-    is_folder = item_type in ('folder', 'worker_folder', 'cloud')
-    clean_name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE).strip()
-
-    res_tag = ''
-    if not is_folder:
-        clean_name = re.sub(r'\.(?:mkv|mp4|avi|webm)$', '', clean_name, flags=re.IGNORECASE).strip()
-
-        res_matches = re.findall(r'\b\d{3,4}p\b|\b4K\b', clean_name, flags=re.IGNORECASE)
-        if res_matches:
-            if len(res_matches) > 1:
-                res_tag = '-'.join(sorted(res_matches, key=lambda x: int(re.sub(r'\D', '', x)) if re.sub(r'\D', '', x) else 0, reverse=True))
-            else:
-                res_tag = res_matches[0]
-                
-            clean_name = re.sub(r'\[\s*(?:\d{3,4}p|4K)(?:-\d{3,4}p)?\s*\]', '', clean_name, flags=re.IGNORECASE)
-            clean_name = re.sub(r'\b(?:\d{3,4}p|4K)\b', '', clean_name, flags=re.IGNORECASE)
-
-        clean_name = re.sub(r'\[\s*\]', '', clean_name)
-        clean_name = re.sub(r'\s+', ' ', clean_name).strip(' .-_')
-
-    right_parts = []
-    if res_tag and not is_folder:
-        right_parts.append(res_tag)
-    if size_str:
-        plain_size = size_str.strip('()')
-        if plain_size:
-            right_parts.append(plain_size)
-
-    right_str = '  '.join(right_parts)
-
-    cols, _ = shutil.get_terminal_size((80, 24))
-    avail_width = max(30, cols - 8)
-
-    if is_folder:
-        left_plain = f"🗁  {clean_name}"
-        left_ansi = f"\033[1;38;5;215m🗁  {clean_name}\033[0m"
-    elif is_watched:
-        left_plain = f"✓  {clean_name}"
-        left_ansi = f"\033[90m✓  {clean_name}\033[0m"
-    elif item_type in ('video', 'direct_video', 'file'):
-        left_plain = f"▶  {clean_name}"
-        left_ansi = f"\033[1;37m▶  {clean_name}\033[0m"
-    else:
-        left_plain = f"   {clean_name}"
-        left_ansi = f"\033[0m   {clean_name}"
-
-    if right_str:
-        pad_count = max(2, avail_width - len(left_plain) - len(right_str))
-        spaces = " " * pad_count
-        return f"{left_ansi}{spaces}\033[90m{right_str}\033[0m"
-    else:
-        return left_ansi
-
-def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
-    mime = cf.mime_type.lower() if cf.mime_type else ''
-    s_str = format_bytes(cf.size) if cf.size else ""
-    if 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder':
-        return format_item_label(cf.name, 'folder', is_watched=is_watched)
-    elif 'video' in mime:
-        return format_item_label(cf.name, 'video', size_str=s_str, is_watched=is_watched)
-    else:
-        return format_item_label(cf.name, 'file', size_str=s_str, is_watched=is_watched)
+def truncate_middle(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    half = (max_len - 2) // 2
+    remainder = max_len - 2 - half
+    return text[:half] + ".." + text[-remainder:]
 
 def flush_stdin():
     if sys.stdin.isatty() and termios is not None:
@@ -833,9 +1136,7 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
         if reload_cmd:
             cmd.append(f"--bind=start:reload({reload_cmd})")
             if anime_title:
-                script_path = os.path.abspath(__file__)
-                toggle_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch toggle_watched {shlex.quote(anime_title)} {{3}}"
-                cmd.append(f"--bind=ctrl-w:execute-silent({toggle_cmd})+reload({reload_cmd})")
+                cmd.append(f"--bind=ctrl-w:reload({reload_cmd} --toggle {{3}})")
             else:
                 cmd.append(f"--bind=ctrl-w:reload({reload_cmd})")
         else:
@@ -845,7 +1146,10 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
             cmd.append(f"--header={header}")
         if default_idx is not None and default_idx >= 0:
             pos_str = str(default_idx + 1)
-            cmd.append(f"--bind=start:pos({pos_str}),load:pos({pos_str})")
+            if reload_cmd:
+                cmd.append(f"--bind=load:pos({pos_str})")
+            else:
+                cmd.append(f"--bind=start:pos({pos_str}),load:pos({pos_str})")
             
         text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
         p = subprocess.run(cmd, input=text if not reload_cmd else None, text=True, capture_output=True)
@@ -986,21 +1290,6 @@ def fzf_search_prompt():
     except (EOFError, KeyboardInterrupt):
         return ("exit", None)
 
-def init_session():
-    global session
-    if session is not None:
-        return
-    from curl_cffi import requests as cffi_requests
-    session = cffi_requests.Session(impersonate="firefox133")
-    load_cookies()
-    try:
-        session.get("https://animetoki.com", timeout=3)
-        session.get("https://cloud.animetoki.com", timeout=3)
-        session.get("https://drive.animetoki.com", timeout=3)
-        save_cookies()
-    except Exception as e:
-        logger.debug(f"Warning: Failed to warm up session: {e}")
-
 def check_deps(download_mode):
     if download_mode:
         return
@@ -1008,23 +1297,6 @@ def check_deps(download_mode):
         return
     if not shutil.which("mpv"):
         sys.exit("Error: 'mpv' is not installed or not in PATH. Please install mpv to stream.")
-
-def safe_request(method, url, max_retries=3, timeout=3, **kwargs):
-    global session
-    if session is None:
-        init_session()
-    for attempt in range(max_retries):
-        try:
-            resp = getattr(session, method)(url, impersonate="firefox133", timeout=timeout, **kwargs)
-            resp.raise_for_status()
-            save_cookies()
-            return resp
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.debug(f"Failed to fetch {url} after {max_retries} attempts. Error: {e}")
-                return None
-            time.sleep(1)
-    return None
 
 def safe_input(prompt, max_val=None, allow_zero_back=True, default_val=None):
     while True:
@@ -1069,7 +1341,6 @@ def stream_in_mpv(download_url, title=None) -> bool:
         ]
         if title:
             am_cmd.extend(['--es', 'title', title])
-        logger.info(f"Launching mpv-android: {' '.join(am_cmd)}")
         subprocess.Popen(
             am_cmd,
             stdout=subprocess.DEVNULL,
@@ -1100,7 +1371,6 @@ def stream_in_mpv(download_url, title=None) -> bool:
 
     if title:
         mpv_flags.append(f'--force-media-title={title}')
-    logger.info(f"Launching mpv: {download_url}")
     print(f"\033[1;34mPlaying {title or ''}...\033[0m")
 
     max_percent = 0.0
@@ -1208,6 +1478,7 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
 
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
+        print("\033[31mError: Connection failed or request returned an error. Please check your network or proxy settings.\033[0m")
         return
     from bs4 import BeautifulSoup
     soup_anime_list = BeautifulSoup(res_search_animes.content, 'html.parser')
@@ -1257,26 +1528,6 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
             if r == "main_menu":
                 return "main_menu"
 
-def classify_link(url):
-    video_exts = ('.mkv', '.mp4', '.avi', '.webm')
-    parsed = urlparse(url)
-    path_lower = parsed.path.lower()
-    query_lower = parsed.query.lower()
-    
-    if 'cloud.animetoki.com' in parsed.netloc or 'drive.animetoki.com' in parsed.netloc:
-        return 'cloud'
-    
-    for ext in video_exts:
-        if path_lower.endswith(ext) or f'{ext}?' in path_lower or f'{ext}?' in url.lower():
-            return 'direct_video'
-    if 'a=view' in query_lower:
-        return 'direct_video'
-    
-    if parsed.path.endswith('/'):
-        return 'worker_folder'
-    
-    return 'unknown'
-
 def resolve_stream_url(url):
     parsed = urlparse(url)
     if 'workers.dev' not in parsed.netloc:
@@ -1294,7 +1545,6 @@ def resolve_stream_url(url):
     file_name = path.split('/')[-1]
     
     parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}?a=view"
-    logger.debug(f"resolve_stream_url: fetching folder API {parent_url}")
     
     res = safe_request('post', parent_url)
     if not res:
@@ -1307,10 +1557,9 @@ def resolve_stream_url(url):
                 file_id = f.get('id')
                 encoded_name = base64.b64encode(unquote(file_name).encode()).decode()
                 stream_url = f"{parsed.scheme}://{parsed.netloc}/?a=download&id={file_id}&name={encoded_name}"
-                logger.debug(f"resolve_stream_url: resolved to {stream_url}")
                 return stream_url
-    except Exception as e:
-        logger.debug(f"resolve_stream_url error: {e}")
+    except Exception:
+        pass
         
     return url
 
@@ -1364,10 +1613,7 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
                             tags=tags_str
                         )
                         if link_type == 'cloud':
-                            parsed = urlparse(selected_url)
-                            domain_url = f"https://{parsed.netloc}/"
-                            segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
-                            result = {"type": "cloud", "url": domain_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
+                            result = {"type": "cloud", "url": encode_cloud_url(selected_url), "hist_ctx": hist_ctx}
                         elif link_type == 'direct_video':
                             result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
                         elif link_type == 'worker_folder':
@@ -1413,6 +1659,8 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
         label = link.get_text(strip=True)
         href = urljoin(base_url, link['href'])
         link_type = classify_link(href)
+        if link_type == 'cloud':
+            href = encode_cloud_url(href)
         link_data.append((label, href, link_type))
 
     path_parts = [best_raw]
@@ -1457,10 +1705,7 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
                 tags=tags_str
             )
             if link_type == 'cloud':
-                parsed = urlparse(selected_url)
-                domain_url = f"https://{parsed.netloc}/"
-                segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
-                result = {"type": "cloud", "url": domain_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
+                result = {"type": "cloud", "url": encode_cloud_url(selected_url), "hist_ctx": hist_ctx}
             elif link_type == 'direct_video':
                 direct_episodes = [(l, u) for l, u, t in link_data if t == 'direct_video']
                 direct_episodes.sort(key=lambda e: natural_sort_key(e[0]))
@@ -1474,83 +1719,6 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
             r_disp = _dispatch_result(result, download_mode)
             if r_disp == "main_menu":
                 return "main_menu"
-
-def fetch_content(url):
-    cached = get_cached_fetch("cloud:" + url)
-    if cached:
-        files_data = cached.get("files", [])
-        node_idx = cached.get("node_index", "")
-        files = [CloudFile(**x) for x in files_data]
-        return files, node_idx
-
-    post_response = safe_request('post', url)
-    if not post_response:
-        return None, None
-        
-    try:
-        dict_json_ = post_response.json()
-    except Exception as e:
-        logger.debug(f"Error parsing JSON from cloud API: {e}")
-        return None, None
-        
-    initial_file_list = dict_json_.get("files")
-    if not initial_file_list:
-        logger.debug("No files found in this folder.")
-        return None, None
-        
-    initial_node_index = str(dict_json_.get("node_index", ""))
-    initial_file_list.sort(key=lambda item: natural_sort_key(item.get("name", "")))
-    
-    files_data = [
-        {
-            "name": x.get("name", ""),
-            "id": x.get("id", ""),
-            "mime_type": x.get("mimeType", ""),
-            "node_index": initial_node_index,
-            "size": int(x.get("size", 0) or 0)
-        }
-        for x in initial_file_list
-    ]
-    set_cached_fetch("cloud:" + url, {"files": files_data, "node_index": initial_node_index})
-    files = [CloudFile(**x) for x in files_data]
-    return files, initial_node_index
-
-def fetch_worker_folder(url):
-    cached = get_cached_fetch("worker:" + url)
-    if cached:
-        return [tuple(x) for x in cached]
-
-    res = safe_request('get', url)
-    if not res:
-        return None
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(res.content, 'html.parser')
-    
-    folder_parsed = urlparse(url)
-    folder_domain = folder_parsed.netloc
-    folder_path = folder_parsed.path
-    
-    entries = []
-    for a in soup.select('a[href]'):
-        href = a.get('href', '')
-        if not href or href in ('.', '..', '../'):
-            continue
-        full_url = urljoin(url, href)
-        link_parsed = urlparse(full_url)
-        if link_parsed.netloc != folder_domain:
-            continue
-        if not link_parsed.path.startswith(folder_path.split('/0:/')[0]):
-            continue
-        label = a.get_text(strip=True) or unquote(link_parsed.path.split('/')[-1] or link_parsed.path.split('/')[-2])
-        link_type = classify_link(full_url)
-        entries.append((label, full_url, link_type))
-    
-    if not entries:
-        return None
-    
-    entries.sort(key=lambda e: natural_sort_key(e[0]))
-    set_cached_fetch("worker:" + url, entries)
-    return entries
 
 def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=None):
     if resume_from:
@@ -1572,12 +1740,20 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
 
     while True:
         header = build_header(display_stack)
+        entries = fetch_worker_folder(current_url)
+        watched = get_watched_list(hist_ctx)
+        first_unwatched_idx = None
+        if entries:
+            for i, (label, link, link_type) in enumerate(entries):
+                if link_type in ('video', 'direct_video', 'file') and label not in watched:
+                    first_unwatched_idx = i
+                    break
 
         if use_fzf:
             script_path = os.path.abspath(__file__)
             anime_t = hist_ctx.title if hist_ctx else ""
             reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch worker_folder {shlex.quote(current_url)} {shlex.quote(anime_t)}"
-            res = fzf_select(prompt="Select: ", header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
+            res = fzf_select(prompt="Select: ", default_idx=first_unwatched_idx, header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
             if res is None:
                 if folder_stack:
                     current_url = folder_stack.pop()
@@ -1610,19 +1786,16 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
                         selected_url = raw_parts[3]
                         link_type = raw_parts[4]
         else:
-            entries = fetch_worker_folder(current_url)
             if not entries:
                 while folder_stack and not entries:
                     current_url = folder_stack.pop()
                     if len(display_stack) > 2: display_stack.pop()
                     entries = fetch_worker_folder(current_url)
                 if not entries:
-                    logger.debug("Worker folder unreachable and stack exhausted.")
                     return False
             header_with_stats = build_header(display_stack, count_items_summary(entries))
-            watched = get_watched_list(hist_ctx)
             labels = [format_item_label(l, t, is_watched=(l in watched)) for l, _, t in entries]
-            res = fzf_select(labels, "Select: ", header=header_with_stats, footer=footer)
+            res = fzf_select(labels, "Select: ", default_idx=first_unwatched_idx, header=header_with_stats, footer=footer)
             if res is None:
                 if folder_stack:
                     current_url = folder_stack.pop()
@@ -1680,12 +1853,20 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
     header = build_header(path_parts, info_str)
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
 
+    watched = get_watched_list(hist_ctx)
+    first_unwatched_idx = None
+    if episodes:
+        for i, (ep_label, ep_url) in enumerate(episodes):
+            if ep_label not in watched:
+                first_unwatched_idx = i
+                break
+
     def _select_ep_prompt(cur_idx):
-        watched = get_watched_list(hist_ctx)
-        items = [format_item_label(e[0], "video", is_watched=(e[0] in watched)) for e in episodes]
+        w_list = get_watched_list(hist_ctx)
+        items = [format_item_label(e[0], "video", is_watched=(e[0] in w_list)) for e in episodes]
         return fzf_select(items, "Select episode: ", default_idx=cur_idx, header=header, footer=footer)
 
-    idx = selected_idx if (selected_idx is not None and 0 <= selected_idx < len(episodes)) else 0
+    idx = selected_idx if (selected_idx is not None and 0 <= selected_idx < len(episodes)) else (first_unwatched_idx if first_unwatched_idx is not None else 0)
 
     if resume:
         res = _select_ep_prompt(idx)
@@ -1771,11 +1952,22 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
     while True:
         header = build_header(display_stack)
         if not selected_file:
+            files, _ = fetch_content(current_folder_url)
+            watched = get_watched_list(hist_ctx)
+            first_unwatched_idx = None
+            if files:
+                for i, cf in enumerate(files):
+                    mime = cf.mime_type.lower() if cf.mime_type else ''
+                    is_folder = 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder'
+                    if not is_folder and cf.name not in watched:
+                        first_unwatched_idx = i
+                        break
+
             if use_fzf:
                 script_path = os.path.abspath(__file__)
                 anime_t = hist_ctx.title if hist_ctx else ""
                 reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch cloud_folder {shlex.quote(current_folder_url)} {shlex.quote(anime_t)}"
-                res = fzf_select(prompt="Select file: ", header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
+                res = fzf_select(prompt="Select file: ", default_idx=first_unwatched_idx, header=header, footer=footer, reload_cmd=reload_cmd, anime_title=anime_t)
                 if res is None:
                     if folder_stack:
                         current_folder_url = folder_stack.pop()
@@ -1898,7 +2090,8 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
         else:
             folder_stack.append(current_folder_url)
             display_stack.append(selected_file.name)
-            current_folder_url += base64.b64encode(unquote(selected_file.name).encode()).decode() + "/"
+            sub_seg = base64.b64encode(unquote(selected_file.name).encode()).decode()
+            current_folder_url = encode_cloud_url(current_folder_url + sub_seg + "/")
             selected_file = None
     return True
 
@@ -1915,12 +2108,10 @@ def _dispatch_result(result, download_mode):
         return browse_worker_folder(result["url"], download_mode, hist_ctx=hist_ctx)
 
 def resume_history(title, entry, download_mode=False):
-    logger.debug(f"Resuming history for '{title}': {entry}")
     anime_url = entry.get("anime_url")
     source_type = entry.get("source_type")
     
     if not source_type or not anime_url:
-        logger.debug(f"Legacy entry or missing source_type for '{title}'. Navigating from home URL.")
         if anime_url:
             return anime_download_link(anime_url, download_mode=download_mode)
         return
@@ -1974,113 +2165,7 @@ def search(query, download_mode=False):
 
 def signal_handler(sig, frame):
     print("\nExiting...")
-    sys.exit(0)
-
-def run_internal_fetch(args):
-    if not args:
-        sys.exit(1)
-    from bs4 import BeautifulSoup
-    init_session()
-    action = args[0]
-    action_args = args[1:]
-    
-    try:
-        if action == "toggle_watched":
-            anime_title = action_args[0] if len(action_args) > 0 else ""
-            item_name = action_args[1] if len(action_args) > 1 else ""
-            if anime_title and item_name:
-                toggle_watched_entry(anime_title, item_name)
-            sys.exit(0)
-
-        elif action == "search":
-            query = " ".join(action_args)
-            cached = get_cached_fetch("search:" + query)
-            if cached:
-                raw_names, urls = cached["raw_names"], cached["urls"]
-            else:
-                res = safe_request('get', search_url + query)
-                if not res:
-                    print(f"ERROR: Failed to connect for query '{query}'")
-                    sys.exit(1)
-                soup = BeautifulSoup(res.content, 'html.parser')
-                anime_list = soup.select('.post-item-inner > a:first-child')
-                if not anime_list:
-                    print("ERROR: No results found.")
-                    sys.exit(1)
-                raw_names = [a.get('aria-label', 'Unknown') for a in anime_list]
-                urls = [urljoin(base_url, a['href']) for a in anime_list]
-                set_cached_fetch("search:" + query, {"raw_names": raw_names, "urls": urls})
-
-            for i, (name, url) in enumerate(zip(raw_names, urls)):
-                lbl = format_anime_title_label(name)
-                print(f"{i}\t{lbl}\t{url}\t{name}")
-
-        elif action == "anime_sources":
-            selected_anime_url = action_args[0]
-            raw_title = action_args[1] if len(action_args) > 1 else ""
-            cached = get_cached_fetch("sources:" + selected_anime_url)
-            if cached:
-                items_data, best_raw = cached["items_data"], cached["best_raw"]
-            else:
-                res_anime = safe_request('get', selected_anime_url)
-                if not res_anime:
-                    print("ERROR: Failed to fetch anime details.")
-                    sys.exit(1)
-                soup = BeautifulSoup(res_anime.content, 'html.parser')
-                anime_title = soup.find('h1', class_="post-title entry-title")
-                page_raw_title = anime_title.get_text().strip() if anime_title else "Unknown"
-                best_raw = raw_title if (raw_title and is_raw_release_title(raw_title)) else (page_raw_title if is_raw_release_title(page_raw_title) else (raw_title if len(raw_title) > len(page_raw_title) else page_raw_title))
-
-                cloud_links = soup.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
-                cdn_links = [a for a in soup.select('a.shortc-button[href]') if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
-                all_links = list(cloud_links) + list(cdn_links)
-                if not all_links:
-                    print("ERROR: No streaming links found for this anime.")
-                    sys.exit(1)
-                items_data = []
-                for link in all_links:
-                    label = link.get_text(strip=True)
-                    href = urljoin(base_url, link['href'])
-                    link_type = classify_link(href)
-                    if link_type == 'cloud':
-                        parsed = urlparse(href)
-                        domain_url = f"https://{parsed.netloc}/"
-                        segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
-                        href = domain_url + "/".join(segments) + "/"
-                    items_data.append((label, href, link_type))
-                set_cached_fetch("sources:" + selected_anime_url, {"items_data": items_data, "best_raw": best_raw})
-
-            for i, (label, href, link_type) in enumerate(items_data):
-                lbl = format_item_label(label, link_type)
-                print(f"{i}\t{lbl}\t{label}\t{href}\t{link_type}\t{best_raw}")
-
-        elif action == "cloud_folder":
-            url = action_args[0]
-            anime_title = action_args[1] if len(action_args) > 1 else ""
-            watched = get_watched_list(anime_title)
-            files, _ = fetch_content(url)
-            if not files:
-                print("ERROR: No files found in cloud folder.")
-                sys.exit(1)
-            for i, cf in enumerate(files):
-                lbl = format_cloud_file_label(cf, is_watched=(cf.name in watched))
-                print(f"{i}\t{lbl}\t{cf.name}\t{cf.id}\t{cf.mime_type}\t{cf.node_index}\t{cf.size}")
-
-        elif action == "worker_folder":
-            url = action_args[0]
-            anime_title = action_args[1] if len(action_args) > 1 else ""
-            watched = get_watched_list(anime_title)
-            entries = fetch_worker_folder(url)
-            if not entries:
-                print("ERROR: No entries found in worker folder.")
-                sys.exit(1)
-            for i, (label, full_url, link_type) in enumerate(entries):
-                lbl = format_item_label(label, link_type, is_watched=(label in watched))
-                print(f"{i}\t{lbl}\t{label}\t{full_url}\t{link_type}")
-        sys.exit(0)
-    except Exception as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
+    os._exit(0)
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -2090,7 +2175,8 @@ def main():
     parser.add_argument("-d", "--download", action="store_true", help="Download the video instead of playing it")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
-    parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history")
+    parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history (and exit)")
+    parser.add_argument("--version", action="version", version="anitokiPy 2.0")
     parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -2099,17 +2185,17 @@ def main():
         return
 
     if args.verbose:
+        import logging
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
         logger.addHandler(console_handler)
 
-    logger.info("=== anitokipy session started ===")
-
     check_deps(args.download)
     init_session()
 
-    initial_query = " ".join(args.query) if args.query else None
+    raw_query = " ".join(args.query).strip() if args.query else ""
+    initial_query = raw_query if raw_query else None
 
     if getattr(args, 'clear_history', False):
         try:
