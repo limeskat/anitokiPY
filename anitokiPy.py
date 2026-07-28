@@ -11,7 +11,7 @@ import re
 import os
 import logging
 import threading
-import atexit
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 import urllib.request
@@ -58,24 +58,6 @@ def load_config():
 CONFIG = load_config()
 UA = CONFIG["user_agent"]
 
-_alt_screen_active = False
-
-def enter_alt_screen():
-    global _alt_screen_active
-    if not _alt_screen_active and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-        sys.stdout.write("\033[?1049h\033[H\033[2J")
-        sys.stdout.flush()
-        _alt_screen_active = True
-
-def exit_alt_screen():
-    global _alt_screen_active
-    if _alt_screen_active and sys.stdout.isatty():
-        sys.stdout.write("\033[?1049l")
-        sys.stdout.flush()
-        _alt_screen_active = False
-
-atexit.register(exit_alt_screen)
-
 def is_termux():
     return os.environ.get('TERMUX_VERSION') is not None or os.path.isdir('/data/data/com.termux')
 
@@ -84,6 +66,44 @@ search_url = "https://animetoki.com/?s="
 
 session = None
 hist_file = Path.home() / ".local" / "state" / "anitokipy" / "ani-hsts"
+COOKIE_PATH = Path.home() / ".local" / "state" / "anitokipy" / "cookies.json"
+
+def save_cookies():
+    if not session or not hasattr(session, "cookies"):
+        return
+    try:
+        COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        jar = getattr(session.cookies, "jar", session.cookies)
+        cookies_data = []
+        for c in jar:
+            cookies_data.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": getattr(c, "domain", ""),
+                "path": getattr(c, "path", "/")
+            })
+        tmp_file = COOKIE_PATH.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
+            json.dump(cookies_data, f)
+        tmp_file.replace(COOKIE_PATH)
+    except Exception as e:
+        logger.debug(f"Failed to save cookies: {e}")
+
+def load_cookies():
+    if not session or not COOKIE_PATH.exists():
+        return
+    try:
+        with open(COOKIE_PATH, "r") as f:
+            cookies_data = json.load(f)
+        if isinstance(cookies_data, list):
+            for c in cookies_data:
+                if isinstance(c, dict) and "name" in c and "value" in c:
+                    kwargs = {}
+                    if c.get("domain"): kwargs["domain"] = c["domain"]
+                    if c.get("path"): kwargs["path"] = c["path"]
+                    session.cookies.set(c["name"], c["value"], **kwargs)
+    except Exception as e:
+        logger.debug(f"Failed to load cookies: {e}")
 
 def _cookie_header():
     if not session or not hasattr(session, "cookies"):
@@ -118,67 +138,6 @@ class HistoryContext:
     raw_title: str = ""
     tags: str = ""
 
-class Spinner:
-    def __init__(self, message="Fetching..."):
-        self.message = message
-        self.stop_event = threading.Event()
-        self.thread = None
-
-    def _spin(self):
-        chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        idx = 0
-        use_fzf_box = _alt_screen_active or (shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty())
-
-        while not self.stop_event.is_set():
-            char = chars[idx % len(chars)]
-            if sys.stdout.isatty():
-                if use_fzf_box:
-                    cols, rows = shutil.get_terminal_size((80, 24))
-                    title = " AnimeToki CLI "
-                    pad_top = max(0, (cols - len(title) - 2) // 2)
-                    pad_rem = max(0, cols - len(title) - 2 - pad_top)
-                    border_top = "╭" + "─" * pad_top + title + "─" * pad_rem + "╮"
-                    border_bot = "╰" + "─" * (cols - 2) + "╯"
-                    empty_line = "│" + " " * (cols - 2) + "│"
-                    
-                    msg_str = f"{char} {self.message}"
-                    pad_msg = max(0, (cols - 2 - len(msg_str)) // 2)
-                    pad_msg_rem = max(0, cols - 2 - pad_msg - len(msg_str))
-                    msg_line = "│" + " " * pad_msg + f"\033[1;36m{char}\033[0m {self.message}" + " " * pad_msg_rem + "│"
-                    
-                    mid_row = rows // 2
-                    out = ["\033[H", border_top]
-                    for r in range(1, rows - 1):
-                        out.append(msg_line if r == mid_row else empty_line)
-                    out.append(border_bot)
-                    sys.stdout.write("".join(out))
-                    sys.stdout.flush()
-                else:
-                    sys.stdout.write(f"\r\033[K\033[1;36m  > \033[0m\033[36m{char}\033[0m {self.message}")
-                    sys.stdout.flush()
-            idx += 1
-            time.sleep(0.08)
-
-        if not use_fzf_box and sys.stdout.isatty():
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
-
-    def __enter__(self):
-        if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-            enter_alt_screen()
-        if sys.stdout.isatty():
-            self.thread = threading.Thread(target=self._spin, daemon=True)
-            self.thread.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.thread:
-            self.stop_event.set()
-            self.thread.join()
-        if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-            exit_alt_screen()
-
-
 def is_raw_release_title(t: str) -> bool:
     """Check if title string contains raw release details (resolution, dual audio, etc.)."""
     return bool(re.search(r'\bDual Audio\b|\bSubbed\b|\b1080p\b|\b720p\b|\[.*?\]|Season \d+', str(t), re.I))
@@ -196,7 +155,6 @@ def save_history_entry(title, payload):
 
     target_url = payload.get("anime_url", "")
     
-    # Deduplicate existing keys with matching anime_url or matching key
     existing = {}
     keys_to_remove = []
     for k, v in hist.items():
@@ -485,16 +443,9 @@ def truncate_middle(text: str, max_len: int) -> str:
     return text[:half] + ".." + text[-remainder:]
 
 def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
-    """
-    Parses a raw anime release title into:
-    1. clean_title: Readable display title (preserving named subtitles/spin-offs with '+ ')
-    2. path_dir: Root path folder name (/Title)
-    3. tags_str: Period-separated right-side tags (e.g. Dual.S1-S3.M.1080p)
-    """
     working = raw_title.strip()
     working = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', working, flags=re.IGNORECASE).strip()
 
-    # 1. Extract Resolution & Bracket Info [...]
     brackets = re.findall(r'\[(.*?)\]', working)
     res_tag = ''
     for b in brackets:
@@ -507,7 +458,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
 
     working = re.sub(r'\[.*?\]', '', working).strip()
 
-    # 2. Extract Audio, Sub & Codec Specs
     audio_tag = ''
     audio_patterns = [
         (r'\bDual Audio\b|\bDual\b', 'Dual'),
@@ -528,7 +478,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
             codec_tags.append(codec.upper())
             working = re.sub(r'\b' + codec + r'\b', '', working, flags=re.I).strip()
 
-    # 3. Classify Parentheses (...) Contents
     p_match = re.search(r'\((.*?)\)', working)
     generic_tags = []
     named_subtitles = []
@@ -544,7 +493,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
         for item in items:
             rem_item = item
 
-            # Season detection
             m_s = re.search(r'Seasons?\s*(\d+)(?:\s*[-+to\s]+\s*(\d+))?', rem_item, re.I)
             if m_s:
                 has_seasons = True
@@ -562,7 +510,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
                 generic_tags.append('Final')
                 rem_item = re.sub(r'Final Season', '', rem_item, flags=re.I).strip()
 
-            # Content Type detection
             if re.search(r'\bMovies?\b|\bThe Movie\b', rem_item, re.I):
                 if 'M' not in generic_tags: generic_tags.append('M')
                 rem_item = re.sub(r'\bMovies?\b|\bThe Movie\b', '', rem_item, flags=re.I).strip()
@@ -591,7 +538,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
             if rem_item:
                 named_subtitles.append(rem_item)
 
-    # 4. Final Reassembly
     base_title = re.sub(r'\bComplete Series\b|\bComplete\b', '', base_title, flags=re.I).strip()
     base_title = re.sub(r'\s+', ' ', base_title).strip(' -:')
 
@@ -615,7 +561,6 @@ def parse_anime_title(raw_title: str) -> tuple[str, str, str]:
     return clean_title, path_dir, tags_str
 
 def format_anime_title_label(raw_title: str) -> str:
-    """Formats an anime title with clean display title on left and right-aligned tags in gray."""
     clean_title, path_dir, tags_str = parse_anime_title(raw_title)
     if not tags_str:
         return clean_title
@@ -626,7 +571,6 @@ def format_anime_title_label(raw_title: str) -> str:
     return f"{clean_title}{spaces}\033[90m{tags_str}\033[0m"
 
 def format_history_label(title: str, entry: dict = None) -> str:
-    """Formats a watch history entry with '[History]' prefix, clean display title on left, and right-aligned tags in gray."""
     raw = ""
     saved_tags = ""
     if isinstance(entry, dict):
@@ -661,7 +605,6 @@ def format_history_label(title: str, entry: dict = None) -> str:
     return left_ansi
 
 def build_header(path_parts: list, items_info: str = "") -> str:
-    """Build a clean header with dynamic breadcrumb path truncated to fit terminal width."""
     cols, _ = shutil.get_terminal_size((80, 24))
     clean_parts = []
     for p in path_parts:
@@ -691,7 +634,6 @@ def build_header(path_parts: list, items_info: str = "") -> str:
     return f"{path_str}{info_suffix}"
 
 def build_footer(actions: list) -> str:
-    """Build a clean CLI footer string from (key, action_label) tuples or strings."""
     parts = []
     for item in actions:
         if isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -701,7 +643,6 @@ def build_footer(actions: list) -> str:
     return " │ ".join(parts)
 
 def count_items_summary(items_or_files):
-    """Return a string like '12 Files, 2 Folders' for header stats."""
     if not items_or_files:
         return ""
     folders = 0
@@ -730,7 +671,6 @@ def count_items_summary(items_or_files):
     return ", ".join(parts)
 
 def format_item_label(name: str, item_type: str, size_str: str = "", is_watched: bool = False) -> str:
-    """Format label with type icon, clean name (no extensions/res brackets), right-aligned resolution tag & file size, and ANSI colors."""
     is_folder = item_type in ('folder', 'worker_folder', 'cloud')
     clean_name = re.sub(r'\[(?:AnimeSakura|AnimeToki)\]\s*', '', name, flags=re.IGNORECASE).strip()
 
@@ -738,7 +678,6 @@ def format_item_label(name: str, item_type: str, size_str: str = "", is_watched:
     if not is_folder:
         clean_name = re.sub(r'\.(?:mkv|mp4|avi|webm)$', '', clean_name, flags=re.IGNORECASE).strip()
 
-        # Extract resolution tag (1080p, 720p, 480p, 4K) for files only
         res_matches = re.findall(r'\b\d{3,4}p\b|\b4K\b', clean_name, flags=re.IGNORECASE)
         if res_matches:
             if len(res_matches) > 1:
@@ -752,7 +691,6 @@ def format_item_label(name: str, item_type: str, size_str: str = "", is_watched:
         clean_name = re.sub(r'\[\s*\]', '', clean_name)
         clean_name = re.sub(r'\s+', ' ', clean_name).strip(' .-_')
 
-    # Construct right-side string (resolution tag BEFORE file size, for files only)
     right_parts = []
     if res_tag and not is_folder:
         right_parts.append(res_tag)
@@ -787,7 +725,6 @@ def format_item_label(name: str, item_type: str, size_str: str = "", is_watched:
         return left_ansi
 
 def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
-    """Format CloudFile with type icon, file size, and ANSI colors."""
     mime = cf.mime_type.lower() if cf.mime_type else ''
     s_str = format_bytes(cf.size) if cf.size else ""
     if 'folder' in mime or cf.mime_type == 'application/vnd.google-apps.folder':
@@ -798,16 +735,13 @@ def format_cloud_file_label(cf: CloudFile, is_watched: bool = False) -> str:
         return format_item_label(cf.name, 'file', size_str=s_str, is_watched=is_watched)
 
 def flush_stdin():
-    """Flush any unread escape codes or keystrokes from stdin."""
     if sys.stdin.isatty() and termios is not None:
         try:
             termios.tcflush(sys.stdin, termios.TCIFLUSH)
         except Exception:
             pass
 
-def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
-    if not items:
-        return None
+def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, footer=None, reload_cmd=None):
     flush_stdin()
     if isinstance(footer, list):
         footer_text = build_footer(footer)
@@ -823,6 +757,7 @@ def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
             "--border=rounded",
             "--border-label= AnimeToki CLI ",
             "--info=inline: ",
+            "--height=100%",
             "--header-border=bottom",
             "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
             "--reverse",
@@ -833,14 +768,16 @@ def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
             "--expect=left,right,ctrl-c,ctrl-d,ctrl-w,ctrl-x",
             f"--footer={footer_text}"
         ]
+        if reload_cmd:
+            cmd.append(f"--bind=start:reload({reload_cmd})")
         if header:
             cmd.append(f"--header={header}")
-        if default_idx is not None and 0 <= default_idx < len(items):
+        if default_idx is not None and default_idx >= 0:
             pos_str = str(default_idx + 1)
             cmd.append(f"--bind=start:pos({pos_str}),load:pos({pos_str})")
             
-        text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
-        p = subprocess.run(cmd, input=text, text=True, capture_output=True)
+        text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
+        p = subprocess.run(cmd, input=text if not reload_cmd else None, text=True, capture_output=True)
         if p.returncode == 130:
             return None
         if p.stdout:
@@ -848,28 +785,34 @@ def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
             if lines:
                 key_pressed = lines[0].strip().lower()
                 selected_idx = None
+                raw_parts = []
                 if len(lines) > 1 and lines[1].strip():
+                    raw_parts = lines[1].split('\t')
                     try:
-                        selected_idx = int(lines[1].split('\t')[0])
+                        selected_idx = int(raw_parts[0])
                     except (ValueError, IndexError):
                         pass
 
+                if len(raw_parts) > 1 and raw_parts[1].startswith("ERROR:"):
+                    return ("error", raw_parts[1])
+
                 if key_pressed == "ctrl-c":
-                    exit_alt_screen()
                     print("\nExiting...")
                     sys.exit(0)
                 elif key_pressed == "ctrl-x":
-                    return ("main_menu", selected_idx)
+                    return ("main_menu", selected_idx, raw_parts)
                 elif key_pressed == "ctrl-d":
-                    return ("delete", selected_idx)
+                    return ("delete", selected_idx, raw_parts)
                 elif key_pressed == "ctrl-w":
-                    return ("toggle_watched", selected_idx)
+                    return ("toggle_watched", selected_idx, raw_parts)
                 elif key_pressed in ("left", "esc"):
                     return None
-                elif selected_idx is not None:
-                    return selected_idx
+                elif selected_idx is not None or raw_parts:
+                    return (selected_idx, raw_parts) if raw_parts else selected_idx
         return None
-    
+
+    if not items:
+        return None
     if header:
         print(f"\033[37m--- AnimeToki CLI | {header} ---\033[0m")
     for i, item in enumerate(items): print(f"{i+1}. {item}")
@@ -878,13 +821,12 @@ def fzf_select(items, prompt, default_idx=None, header=None, footer=None):
     p_str = f"\033[1;36m{prompt}\033[0m"
     if default_idx is not None and 0 <= default_idx < len(items):
         p_str += f" [{default_idx + 1}]: "
-    idx = safe_input(p_str, len(items), default_val=default_idx + 1 if default_idx is not None else None)
+    idx = safe_input(p_str, len(items), allow_zero_back=True, default_val=default_idx + 1 if default_idx is not None else None)
     if idx == 0 or idx is None:
         return None
     return idx - 1
 
 def fzf_search_prompt():
-    """Run search prompt inside fzf interface when available."""
     flush_stdin()
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         while True:
@@ -909,6 +851,7 @@ def fzf_search_prompt():
                 "--border=rounded",
                 "--border-label= AnimeToki CLI ",
                 "--info=inline: ",
+                "--height=100%",
                 "--header-border=bottom",
                 "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
                 "--reverse",
@@ -923,7 +866,6 @@ def fzf_search_prompt():
             text = "\n".join(items) if items else ""
             p = subprocess.run(cmd, input=text, text=True, capture_output=True)
             if p.returncode == 130:
-                # ESC was pressed - re-prompt instead of exiting
                 continue
             if p.stdout:
                 lines = p.stdout.splitlines()
@@ -932,7 +874,6 @@ def fzf_search_prompt():
                 selected_item = lines[2].strip() if len(lines) > 2 else ""
                 
                 if key_pressed == "ctrl-c":
-                    exit_alt_screen()
                     print("\nExiting...")
                     sys.exit(0)
 
@@ -964,10 +905,8 @@ def fzf_search_prompt():
                 if real_title and real_title in hist:
                     return ("history", (real_title, hist[real_title]))
                         
-            # If nothing returned or ESC pressed without output, re-prompt
             continue
     
-    # Fallback to standard terminal input
     try:
         query = input("\033[1;36m> \033[0m").strip()
         if not query or query.lower() in ("exit", "quit"):
@@ -978,13 +917,17 @@ def fzf_search_prompt():
 
 def init_session():
     global session
+    if session is not None:
+        return
     session = cffi_requests.Session(impersonate="firefox133")
+    load_cookies()
     try:
         session.get("https://animetoki.com", timeout=3)
         session.get("https://cloud.animetoki.com", timeout=3)
         session.get("https://drive.animetoki.com", timeout=3)
+        save_cookies()
     except Exception as e:
-        print(f"Warning: Failed to warm up session: {e}")
+        logger.debug(f"Warning: Failed to warm up session: {e}")
 
 def check_deps(download_mode):
     if download_mode:
@@ -998,18 +941,18 @@ def safe_request(method, url, max_retries=3, timeout=3, **kwargs):
     global session
     if session is None:
         init_session()
-    with Spinner("Fetching..."):
-        for attempt in range(max_retries):
-            try:
-                resp = getattr(session, method)(url, impersonate="firefox133", timeout=timeout, **kwargs)
-                resp.raise_for_status()
-                return resp
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    print(f"Failed to fetch {url} after {max_retries} attempts. Error: {e}")
-                    return None
-                time.sleep(1)
-        return None
+    for attempt in range(max_retries):
+        try:
+            resp = getattr(session, method)(url, impersonate="firefox133", timeout=timeout, **kwargs)
+            resp.raise_for_status()
+            save_cookies()
+            return resp
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.debug(f"Failed to fetch {url} after {max_retries} attempts. Error: {e}")
+                return None
+            time.sleep(1)
+    return None
 
 def safe_input(prompt, max_val=None, allow_zero_back=True, default_val=None):
     while True:
@@ -1034,7 +977,6 @@ def safe_input(prompt, max_val=None, allow_zero_back=True, default_val=None):
             sys.exit(0)
 
 def stream_in_mpv(download_url, title=None) -> bool:
-    """Streams video in MPV and returns True if >= 80% was watched."""
     if is_termux():
         mpv_conf_path = "/storage/emulated/0/mpv/mpv.config.mp4"
         try:
@@ -1154,11 +1096,48 @@ def download_file(url, output_name):
         print("curl is not installed. Cannot download.")
 
 def fetch_anime_list(anime_search_url, query=None, download_mode=False):
+    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    path_parts = ['search', query] if query else ['search']
+    header_title = build_header(path_parts)
+    footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
+
+    if use_fzf:
+        script_path = os.path.abspath(__file__)
+        reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch search {shlex.quote(query or '')}"
+        default_idx = None
+        while True:
+            res = fzf_select(prompt="Select anime: ", default_idx=default_idx, header=header_title, footer=footer, reload_cmd=reload_cmd)
+            if res is None:
+                break
+            if isinstance(res, tuple):
+                act = res[0]
+                if act == "main_menu":
+                    return "main_menu"
+                elif act == "error":
+                    print(f"\033[31m{res[1]}\033[0m")
+                    break
+                elif act in ("delete", "toggle_watched"):
+                    raw_parts = res[2] if len(res) > 2 else []
+                    if len(raw_parts) > 3:
+                        clean_t, _, _ = parse_anime_title(raw_parts[3])
+                        if act == "delete": delete_history_entry(clean_t)
+                        else: toggle_watched_entry(clean_t)
+                    continue
+                elif isinstance(act, int):
+                    idx, raw_parts = res
+                    if len(raw_parts) > 3:
+                        anime_url = raw_parts[2]
+                        raw_anime_name = raw_parts[3]
+                        r = anime_download_link(anime_url, download_mode=download_mode, raw_title=raw_anime_name)
+                        if r == "main_menu":
+                            return "main_menu"
+            break
+        return
+
     res_search_animes = safe_request('get', anime_search_url)
     if not res_search_animes:
         return
     soup_anime_list = BeautifulSoup(res_search_animes.content, 'html.parser')
-
     anime_list = soup_anime_list.select('.post-item-inner > a:first-child')
     if not anime_list:
         print("No results found.")
@@ -1167,12 +1146,9 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
     raw_anime_names = [a.get('aria-label', 'Unknown') for a in anime_list]
     display_names = [format_anime_title_label(n) for n in raw_anime_names]
     anime_urls = [urljoin(base_url, a['href']) for a in anime_list]
-    
-    path_parts = ['search', query] if query else ['search']
+
     info_str = f"{len(raw_anime_names)} {'Result' if len(raw_anime_names) == 1 else 'Results'}"
     header = build_header(path_parts, info_str)
-    footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
-    
     default_idx = None
     while True:
         res = fzf_select(display_names, "Select anime: ", default_idx=default_idx, header=header, footer=footer)
@@ -1181,7 +1157,7 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
         if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
             return "main_menu"
         if isinstance(res, tuple):
-            act, idx = res
+            act, idx = res[:2]
             if idx is not None and 0 <= idx < len(anime_urls):
                 default_idx = idx
             if act == "main_menu":
@@ -1209,7 +1185,6 @@ def fetch_anime_list(anime_search_url, query=None, download_mode=False):
                 return "main_menu"
 
 def classify_link(url):
-    """Classify a link as cloud folder, direct video, or worker folder."""
     video_exts = ('.mkv', '.mp4', '.avi', '.webm')
     parsed = urlparse(url)
     path_lower = parsed.path.lower()
@@ -1218,21 +1193,18 @@ def classify_link(url):
     if 'cloud.animetoki.com' in parsed.netloc or 'drive.animetoki.com' in parsed.netloc:
         return 'cloud'
     
-    # Check if it's a direct video file (path ends with video ext, or has ?a=view)
     for ext in video_exts:
         if path_lower.endswith(ext) or f'{ext}?' in path_lower or f'{ext}?' in url.lower():
             return 'direct_video'
     if 'a=view' in query_lower:
         return 'direct_video'
     
-    # If path ends with / it's a folder on workers.dev or similar
     if parsed.path.endswith('/'):
         return 'worker_folder'
     
     return 'unknown'
 
 def resolve_stream_url(url):
-    """Convert a ?a=view URL to a direct streamable URL by fetching its file ID via POST."""
     parsed = urlparse(url)
     if 'workers.dev' not in parsed.netloc:
         if parsed.query:
@@ -1241,7 +1213,6 @@ def resolve_stream_url(url):
             return parsed._replace(query=urlencode(params, doseq=True)).geturl()
         return url
 
-    # For workers.dev links, we must query the parent folder's API
     path = unquote(parsed.path)
     if path.endswith('/'):
         path = path[:-1]
@@ -1271,6 +1242,72 @@ def resolve_stream_url(url):
     return url
 
 def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
+    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
+    path_parts = [raw_title or selected_anime_url]
+    header = build_header(path_parts)
+
+    if use_fzf:
+        script_path = os.path.abspath(__file__)
+        reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch anime_sources {shlex.quote(selected_anime_url)} {shlex.quote(raw_title or '')}"
+        default_idx = None
+        while True:
+            res = fzf_select(prompt="Select source: ", default_idx=default_idx, header=header, footer=footer, reload_cmd=reload_cmd)
+            if res is None:
+                break
+            if isinstance(res, tuple):
+                act = res[0]
+                if act == "main_menu":
+                    return "main_menu"
+                elif act == "error":
+                    print(f"\033[31m{res[1]}\033[0m")
+                    break
+                elif act in ("delete", "toggle_watched"):
+                    raw_parts = res[2] if len(res) > 2 else []
+                    best_raw = raw_parts[5] if len(raw_parts) > 5 else raw_title
+                    clean_t, _, _ = parse_anime_title(best_raw)
+                    if act == "delete":
+                        delete_history_entry(clean_t)
+                        return "main_menu"
+                    else:
+                        toggle_watched_entry(clean_t)
+                    continue
+                elif isinstance(act, int):
+                    idx, raw_parts = res
+                    if len(raw_parts) > 4:
+                        label = raw_parts[2]
+                        selected_url = raw_parts[3]
+                        link_type = raw_parts[4]
+                        best_raw = raw_parts[5] if len(raw_parts) > 5 else raw_title
+                        clean_title, _, tags_str = parse_anime_title(best_raw)
+                        stype = link_type if link_type in ('cloud', 'direct_video', 'worker_folder') else 'direct_episodes'
+                        hist_ctx = HistoryContext(
+                            title=clean_title,
+                            anime_url=selected_anime_url,
+                            source_label=label,
+                            source_type=stype,
+                            source_url=selected_url,
+                            raw_title=best_raw,
+                            tags=tags_str
+                        )
+                        if link_type == 'cloud':
+                            parsed = urlparse(selected_url)
+                            domain_url = f"https://{parsed.netloc}/"
+                            segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
+                            result = {"type": "cloud", "url": domain_url + "/".join(segments) + "/", "hist_ctx": hist_ctx}
+                        elif link_type == 'direct_video':
+                            result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
+                        elif link_type == 'worker_folder':
+                            result = {"type": "worker_folder", "url": selected_url, "hist_ctx": hist_ctx}
+                        else:
+                            result = {"type": "direct_episodes", "episodes": [(label, selected_url)], "selected": 0, "hist_ctx": hist_ctx}
+                        
+                        r_disp = _dispatch_result(result, download_mode)
+                        if r_disp == "main_menu":
+                            return "main_menu"
+            break
+        return
+
     res_anime = safe_request('get', selected_anime_url)
     if not res_anime:
         return
@@ -1289,21 +1326,16 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
     clean_title, path_dir, tags_str = parse_anime_title(best_raw)
     update_history(clean_title, selected_anime_url, raw_title=best_raw)
 
-    # Find cloud links (completed anime)
     cloud_links = soup_anime_list.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
-    # Find workers.dev / CDN links (ongoing anime)
     cdn_links = soup_anime_list.select('a.shortc-button[href]')
-    # Filter cdn_links to exclude cloud links (already captured) and non-download links
     cdn_links = [a for a in cdn_links 
                  if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
-    
     all_links = list(cloud_links) + list(cdn_links)
-    
     if not all_links:
         print("No streaming links found for this anime.")
         return
 
-    link_data = []  # list of (label, full_url, link_type)
+    link_data = []
     for link in all_links:
         label = link.get_text(strip=True)
         href = urljoin(base_url, link['href'])
@@ -1313,7 +1345,6 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
     path_parts = [best_raw]
     info_str = f"{len(link_data)} {'Source' if len(link_data) == 1 else 'Sources'}"
     header = build_header(path_parts, info_str)
-    footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
     default_idx = None
 
     while True:
@@ -1324,7 +1355,7 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
         if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
             return "main_menu"
         if isinstance(res, tuple):
-            act, idx = res
+            act, idx = res[:2]
             if idx is not None and 0 <= idx < len(link_data):
                 default_idx = idx
             if act == "main_menu":
@@ -1352,7 +1383,6 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
                 raw_title=best_raw,
                 tags=tags_str
             )
-            
             if link_type == 'cloud':
                 parsed = urlparse(selected_url)
                 domain_url = f"https://{parsed.netloc}/"
@@ -1372,8 +1402,7 @@ def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
             if r_disp == "main_menu":
                 return "main_menu"
 
-def fetch_content(url):    
-    """Fetch folder content from cloud API and return list of CloudFile objects and node_index."""
+def fetch_content(url):
     post_response = safe_request('post', url)
     if not post_response:
         return None, None
@@ -1381,16 +1410,15 @@ def fetch_content(url):
     try:
         dict_json_ = post_response.json()
     except Exception as e:
-        print(f"Error parsing JSON from cloud API: {e}")
+        logger.debug(f"Error parsing JSON from cloud API: {e}")
         return None, None
         
     initial_file_list = dict_json_.get("files")
     if not initial_file_list:
-        print("No files found in this folder.")
+        logger.debug("No files found in this folder.")
         return None, None
         
     initial_node_index = str(dict_json_.get("node_index", ""))
-
     initial_file_list.sort(key=lambda item: natural_sort_key(item.get("name", "")))
     
     files = [
@@ -1407,7 +1435,6 @@ def fetch_content(url):
     return files, initial_node_index
 
 def fetch_worker_folder(url):
-    """Fetch a workers.dev folder and return list of (name, url, type) entries."""
     res = safe_request('get', url)
     if not res:
         return None
@@ -1424,7 +1451,6 @@ def fetch_worker_folder(url):
             continue
         full_url = urljoin(url, href)
         link_parsed = urlparse(full_url)
-        # Only include links on the same domain and under the same base path
         if link_parsed.netloc != folder_domain:
             continue
         if not link_parsed.path.startswith(folder_path.split('/0:/')[0]):
@@ -1434,111 +1460,123 @@ def fetch_worker_folder(url):
         entries.append((label, full_url, link_type))
     
     if not entries:
-        print("No files found in this folder.")
         return None
     
     entries.sort(key=lambda e: natural_sort_key(e[0]))
     return entries
 
 def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=None):
-    """Browse a workers.dev folder, allowing navigation and playback."""
     if resume_from:
         folder_stack = list(resume_from.get("folder_stack", []))
         current_url = resume_from.get("current_folder_url", url)
-        default_highlight = resume_from.get("selected_file_name")
         display_stack = list(resume_from.get("display_stack", []))
     else:
         folder_stack = []
         current_url = url
-        default_highlight = None
         display_stack = []
-    
+
     if not display_stack:
         anime_title = hist_ctx.title if hist_ctx else "Worker"
         source_label = hist_ctx.source_label if hist_ctx else ""
         display_stack = [anime_title, source_label]
 
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
+    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
 
     while True:
-        entries = fetch_worker_folder(current_url)
-        if not entries:
-            while folder_stack and not entries:
-                current_url = folder_stack.pop()
-                if len(display_stack) > 2:
-                    display_stack.pop()
-                entries = fetch_worker_folder(current_url)
-            if not entries:
-                logger.debug("Worker folder unreachable and stack exhausted.")
-                return False
-        
-        header = build_header(display_stack, count_items_summary(entries))
-        watched = get_watched_list(hist_ctx)
-        labels = [format_item_label(l, t, is_watched=(l in watched)) for l, _, t in entries]
-        default_idx = next((i for i, (l, _, _) in enumerate(entries) if l == default_highlight), None) if default_highlight else None
-        default_highlight = None
+        header = build_header(display_stack)
 
-        res = fzf_select(labels, "Select: ", default_idx=default_idx, header=header, footer=footer)
-        if res is None:
-            if folder_stack:
-                current_url = folder_stack.pop()
-                if len(display_stack) > 2:
-                    display_stack.pop()
-                continue
-            return True
-            
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-            return "main_menu"
-            
-        if isinstance(res, tuple):
-            act, sel_idx = res
-            if sel_idx is not None and 0 <= sel_idx < len(entries):
-                default_idx = sel_idx
-            if act == "main_menu":
-                return "main_menu"
-            elif act == "toggle_watched":
-                if hist_ctx and default_idx is not None:
-                    toggle_watched_entry(hist_ctx.title, entries[default_idx][0])
-                continue
-            elif act == "delete":
-                if hist_ctx:
-                    delete_history_entry(hist_ctx.title)
-                return "main_menu"
-            idx = default_idx
+        if use_fzf:
+            script_path = os.path.abspath(__file__)
+            reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch worker_folder {shlex.quote(current_url)}"
+            res = fzf_select(prompt="Select: ", header=header, footer=footer, reload_cmd=reload_cmd)
+            if res is None:
+                if folder_stack:
+                    current_url = folder_stack.pop()
+                    if len(display_stack) > 2: display_stack.pop()
+                    continue
+                return True
+            if isinstance(res, tuple):
+                act = res[0]
+                if act == "main_menu":
+                    return "main_menu"
+                elif act == "error":
+                    if folder_stack:
+                        current_url = folder_stack.pop()
+                        if len(display_stack) > 2: display_stack.pop()
+                        continue
+                    return True
+                elif act == "toggle_watched":
+                    raw_parts = res[2] if len(res) > 2 else []
+                    if len(raw_parts) > 2 and hist_ctx:
+                        toggle_watched_entry(hist_ctx.title, raw_parts[2])
+                    continue
+                elif act == "delete":
+                    if hist_ctx:
+                        delete_history_entry(hist_ctx.title)
+                    return "main_menu"
+                elif isinstance(act, int):
+                    raw_parts = res[1]
+                    if len(raw_parts) > 4:
+                        label = raw_parts[2]
+                        selected_url = raw_parts[3]
+                        link_type = raw_parts[4]
         else:
-            idx = res
+            entries = fetch_worker_folder(current_url)
+            if not entries:
+                while folder_stack and not entries:
+                    current_url = folder_stack.pop()
+                    if len(display_stack) > 2: display_stack.pop()
+                    entries = fetch_worker_folder(current_url)
+                if not entries:
+                    logger.debug("Worker folder unreachable and stack exhausted.")
+                    return False
+            header_with_stats = build_header(display_stack, count_items_summary(entries))
+            watched = get_watched_list(hist_ctx)
+            labels = [format_item_label(l, t, is_watched=(l in watched)) for l, _, t in entries]
+            res = fzf_select(labels, "Select: ", header=header_with_stats, footer=footer)
+            if res is None:
+                if folder_stack:
+                    current_url = folder_stack.pop()
+                    if len(display_stack) > 2: display_stack.pop()
+                    continue
+                return True
+            if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+                return "main_menu"
+            if isinstance(res, tuple):
+                act, idx = res[:2]
+                if act == "main_menu":
+                    return "main_menu"
+                elif act == "toggle_watched":
+                    if hist_ctx and idx is not None and 0 <= idx < len(entries):
+                        toggle_watched_entry(hist_ctx.title, entries[idx][0])
+                    continue
+                elif act == "delete":
+                    if hist_ctx:
+                        delete_history_entry(hist_ctx.title)
+                    return "main_menu"
+                idx = idx
+            else:
+                idx = res
+            if idx is None or not (0 <= idx < len(entries)):
+                continue
+            label, selected_url, link_type = entries[idx]
 
-        if idx is None or not (0 <= idx < len(entries)):
-            continue
-
-        label, selected_url, link_type = entries[idx]
         if hist_ctx:
             save_worker_history(hist_ctx, current_url, folder_stack, label, display_stack=display_stack)
         
         if link_type in ('direct_video', 'unknown'):
-            video_entries = [(i, l, u) for i, (l, u, t) in enumerate(entries) if t in ('direct_video', 'unknown')]
-            vid_idx = next((j for j, (i, l, u) in enumerate(video_entries) if i == idx), 0)
+            stream_url = resolve_stream_url(selected_url)
+            if download_mode:
+                download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
+                return True
             
-            while True:
-                _, label, selected_url = video_entries[vid_idx]
-                if hist_ctx:
-                    save_worker_history(hist_ctx, current_url, folder_stack, label, display_stack=display_stack)
-                stream_url = resolve_stream_url(selected_url)
-                if download_mode:
-                    download_file(stream_url, unquote(urlparse(selected_url).path.split('/')[-1]))
-                    return True
-                
-                playing_header = build_header(display_stack + [label])
-                stream_in_mpv(stream_url, title=label)
-                act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=playing_header)
-                if act == "main_menu" or (isinstance(act, tuple) and act[0] == "main_menu"):
-                    return "main_menu"
-                if isinstance(act, tuple): act = act[0]
-                if act == 0 or act == "next": vid_idx = min(vid_idx + 1, len(video_entries) - 1)
-                elif act == 1 or act == "replay": pass
-                elif act == 2 or act == "previous": vid_idx = max(vid_idx - 1, 0)
-                elif act == 3 or act == "select": break
-                else: return True
+            stream_in_mpv(stream_url, title=label)
+            playing_header = build_header(display_stack + [label])
+            act = fzf_select(["next", "replay", "previous", "select", "quit"], f"Playing {label}... ", header=playing_header)
+            if act == "main_menu" or (isinstance(act, tuple) and act[0] == "main_menu"):
+                return "main_menu"
+            return True
         elif link_type == 'worker_folder':
             folder_stack.append(current_url)
             display_stack.append(label)
@@ -1546,7 +1584,6 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
     return True
 
 def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=None, resume=False):
-    """Play from a list of direct video episode links."""
     episodes.sort(key=lambda e: natural_sort_key(e[0]))
     anime_title = hist_ctx.title if hist_ctx else "Episodes"
     source_label = hist_ctx.source_label if hist_ctx else ""
@@ -1569,7 +1606,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
         if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
             return "main_menu"
         if isinstance(res, tuple):
-            act, sel_idx = res
+            act, sel_idx = res[:2]
             if sel_idx is not None and 0 <= sel_idx < len(episodes): idx = sel_idx
             if act == "main_menu": return "main_menu"
             elif act == "toggle_watched":
@@ -1607,7 +1644,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
             if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
                 return "main_menu"
             if isinstance(res, tuple):
-                a_type, sel_idx = res
+                a_type, sel_idx = res[:2]
                 if sel_idx is not None and 0 <= sel_idx < len(episodes): idx = sel_idx
                 if a_type == "main_menu": return "main_menu"
                 elif a_type == "toggle_watched":
@@ -1621,65 +1658,22 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
     return True
 
 def play_and_browse(selected_file=None, current_files=None, initial_link_base64=None, download_mode=False, hist_ctx=None, resume_from=None):
-    def _cloud_dl_url(cf: CloudFile):
-        parsed = urlparse(current_folder_url)
+    def _cloud_dl_url(cf: CloudFile, folder_url: str):
+        parsed = urlparse(folder_url)
         domain_url = f"https://{parsed.netloc}"
         return f"{domain_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
 
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
+    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
 
     if resume_from:
         current_folder_url = resume_from["current_folder_url"]
         folder_stack = list(resume_from.get("folder_stack", []))
         display_stack = list(resume_from.get("display_stack", []))
-        files, _ = fetch_content(current_folder_url)
-        while folder_stack and not files:
-            current_folder_url = folder_stack.pop()
-            if len(display_stack) > 2:
-                display_stack.pop()
-            files, _ = fetch_content(current_folder_url)
-        if not files:
-            logger.debug("Resume target cloud folder unreachable and stack exhausted.")
-            return False
-            
-        last_name = resume_from.get("selected_file_name")
-        default_idx = next((i for i, f in enumerate(files) if f.name == last_name), None) if (files and last_name) else None
-        if not display_stack:
-            anime_title = hist_ctx.title if hist_ctx else "Cloud"
-            source_label = hist_ctx.source_label if hist_ctx else ""
-            display_stack = [anime_title, source_label]
-        header = build_header(display_stack, count_items_summary(files))
-        watched = get_watched_list(hist_ctx)
-        res = fzf_select([format_cloud_file_label(f, is_watched=(f.name in watched)) for f in files], "Select file: ", default_idx=default_idx, header=header, footer=footer)
-        if res is None:
-            return True
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-            return "main_menu"
-        if isinstance(res, tuple):
-            act, idx = res
-            if idx is not None and 0 <= idx < len(files):
-                default_idx = idx
-            if act == "main_menu":
-                return "main_menu"
-            elif act == "toggle_watched":
-                if hist_ctx and default_idx is not None:
-                    toggle_watched_entry(hist_ctx.title, files[default_idx].name)
-            elif act == "delete":
-                if hist_ctx:
-                    delete_history_entry(hist_ctx.title)
-                return "main_menu"
-            res_idx = default_idx
-        else:
-            res_idx = res
-        if res_idx is not None and 0 <= res_idx < len(files):
-            selected_file = files[res_idx]
     else:
         current_folder_url = initial_link_base64
-        files = current_files
         folder_stack = []
         display_stack = []
-        if files is None and current_folder_url:
-            files, _ = fetch_content(current_folder_url)
 
     if not display_stack:
         anime_title = hist_ctx.title if hist_ctx else "Cloud"
@@ -1687,56 +1681,91 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
         display_stack = [anime_title, source_label]
 
     while True:
-        header = build_header(display_stack, count_items_summary(files))
+        header = build_header(display_stack)
         if not selected_file:
-            if not files:
-                if folder_stack:
-                    current_folder_url = folder_stack.pop()
-                    if len(display_stack) > 2:
-                        display_stack.pop()
-                    files, _ = fetch_content(current_folder_url)
-                    continue
-                return True
-
-            watched = get_watched_list(hist_ctx)
-            res = fzf_select([format_cloud_file_label(f, is_watched=(f.name in watched)) for f in files], "Select file: ", header=header, footer=footer)
-            if res is None:
-                if folder_stack:
-                    current_folder_url = folder_stack.pop()
-                    if len(display_stack) > 2:
-                        display_stack.pop()
-                    files, _ = fetch_content(current_folder_url)
-                    continue
-                return True
-
-            if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-                return "main_menu"
-
-            if isinstance(res, tuple):
-                act, idx = res
-                if idx is not None and 0 <= idx < len(files):
-                    selected_file = files[idx]
-                if act == "main_menu":
-                    return "main_menu"
-                elif act == "toggle_watched":
-                    if hist_ctx and idx is not None:
-                        toggle_watched_entry(hist_ctx.title, files[idx].name)
-                    selected_file = None
-                    continue
-                elif act == "delete":
-                    if hist_ctx:
-                        delete_history_entry(hist_ctx.title)
-                    return "main_menu"
+            if use_fzf:
+                script_path = os.path.abspath(__file__)
+                reload_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} --internal-fetch cloud_folder {shlex.quote(current_folder_url)}"
+                res = fzf_select(prompt="Select file: ", header=header, footer=footer, reload_cmd=reload_cmd)
+                if res is None:
+                    if folder_stack:
+                        current_folder_url = folder_stack.pop()
+                        if len(display_stack) > 2:
+                            display_stack.pop()
+                        continue
+                    return True
+                if isinstance(res, tuple):
+                    act = res[0]
+                    if act == "main_menu":
+                        return "main_menu"
+                    elif act == "error":
+                        if folder_stack:
+                            current_folder_url = folder_stack.pop()
+                            if len(display_stack) > 2: display_stack.pop()
+                            continue
+                        return True
+                    elif act == "toggle_watched":
+                        raw_parts = res[2] if len(res) > 2 else []
+                        if len(raw_parts) > 2 and hist_ctx:
+                            toggle_watched_entry(hist_ctx.title, raw_parts[2])
+                        continue
+                    elif act == "delete":
+                        if hist_ctx:
+                            delete_history_entry(hist_ctx.title)
+                        return "main_menu"
+                    elif isinstance(act, int):
+                        raw_parts = res[1]
+                        if len(raw_parts) > 6:
+                            selected_file = CloudFile(
+                                name=raw_parts[2],
+                                id=raw_parts[3],
+                                mime_type=raw_parts[4],
+                                node_index=raw_parts[5],
+                                size=int(raw_parts[6]) if raw_parts[6].isdigit() else 0
+                            )
             else:
-                if 0 <= res < len(files):
-                    selected_file = files[res]
+                files, _ = fetch_content(current_folder_url)
+                if not files:
+                    if folder_stack:
+                        current_folder_url = folder_stack.pop()
+                        if len(display_stack) > 2:
+                            display_stack.pop()
+                        continue
+                    return True
+                header_with_stats = build_header(display_stack, count_items_summary(files))
+                watched = get_watched_list(hist_ctx)
+                res = fzf_select([format_cloud_file_label(f, is_watched=(f.name in watched)) for f in files], "Select file: ", header=header_with_stats, footer=footer)
+                if res is None:
+                    if folder_stack:
+                        current_folder_url = folder_stack.pop()
+                        if len(display_stack) > 2:
+                            display_stack.pop()
+                        continue
+                    return True
+                if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
+                    return "main_menu"
+                if isinstance(res, tuple):
+                    act, idx = res[:2]
+                    if act == "main_menu":
+                        return "main_menu"
+                    elif act == "toggle_watched":
+                        if hist_ctx and idx is not None:
+                            toggle_watched_entry(hist_ctx.title, files[idx].name)
+                        continue
+                    elif act == "delete":
+                        if hist_ctx:
+                            delete_history_entry(hist_ctx.title)
+                        return "main_menu"
+                else:
+                    if 0 <= res < len(files):
+                        selected_file = files[res]
 
         if hist_ctx and selected_file:
             save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
 
         is_video = bool(selected_file.mime_type and "video" in selected_file.mime_type.lower())
         if is_video:
-            download_url = _cloud_dl_url(selected_file)
+            download_url = _cloud_dl_url(selected_file, current_folder_url)
             if download_mode:
                 download_file(download_url, selected_file.name)
                 return True
@@ -1744,7 +1773,8 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             playing_header = build_header(display_stack + [selected_file.name])
             stream_in_mpv(download_url, title=selected_file.name)
             
-            video_siblings = [f for f in files if f.mime_type and "video" in f.mime_type.lower()] if files else []
+            files_in_folder, _ = fetch_content(current_folder_url)
+            video_siblings = [f for f in files_in_folder if f.mime_type and "video" in f.mime_type.lower()] if files_in_folder else []
             vid_idx = next((j for j, f in enumerate(video_siblings) if f.name == selected_file.name), 0)
             
             while True:
@@ -1755,19 +1785,21 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                 if isinstance(act, tuple): act = act[0]
 
                 if act == 0 or act == "next":
-                    vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
-                    selected_file = video_siblings[vid_idx]
-                    if hist_ctx:
-                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
-                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
+                    if video_siblings:
+                        vid_idx = min(vid_idx + 1, len(video_siblings) - 1)
+                        selected_file = video_siblings[vid_idx]
+                        if hist_ctx:
+                            save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
+                        stream_in_mpv(_cloud_dl_url(selected_file, current_folder_url), title=selected_file.name)
                 elif act == 1 or act == "replay":
-                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
+                    stream_in_mpv(_cloud_dl_url(selected_file, current_folder_url), title=selected_file.name)
                 elif act == 2 or act == "previous":
-                    vid_idx = max(vid_idx - 1, 0)
-                    selected_file = video_siblings[vid_idx]
-                    if hist_ctx:
-                        save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
-                    stream_in_mpv(_cloud_dl_url(selected_file), title=selected_file.name)
+                    if video_siblings:
+                        vid_idx = max(vid_idx - 1, 0)
+                        selected_file = video_siblings[vid_idx]
+                        if hist_ctx:
+                            save_cloud_history(hist_ctx, current_folder_url, folder_stack, selected_file.name, selected_file.id, selected_file.mime_type, display_stack=display_stack)
+                        stream_in_mpv(_cloud_dl_url(selected_file, current_folder_url), title=selected_file.name)
                 elif act == 3 or act == "select":
                     selected_file = None
                     break
@@ -1778,7 +1810,6 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
             folder_stack.append(current_folder_url)
             display_stack.append(selected_file.name)
             current_folder_url += base64.b64encode(unquote(selected_file.name).encode()).decode() + "/"
-            files, _ = fetch_content(current_folder_url)
             selected_file = None
     return True
 
@@ -1788,34 +1819,7 @@ def _dispatch_result(result, download_mode):
     hist_ctx = result.get("hist_ctx")
     title = hist_ctx.title if hist_ctx else None
     if result["type"] == "cloud":
-        files, _ = fetch_content(result["url"])
-        if not files:
-            return
-        anime_title = hist_ctx.title if hist_ctx else "Cloud"
-        source_label = hist_ctx.source_label if hist_ctx else ""
-        display_stack = [anime_title, source_label]
-        header = build_header(display_stack, count_items_summary(files))
-        watched = get_watched_list(hist_ctx)
-        labels = [format_cloud_file_label(f, is_watched=(f.name in watched)) for f in files]
-        footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
-        res = fzf_select(labels, "Select file: ", header=header, footer=footer)
-        if res is None: return
-        if res == "main_menu" or (isinstance(res, tuple) and res[0] == "main_menu"):
-            return "main_menu"
-        if isinstance(res, tuple):
-            act, idx = res
-            if act == "main_menu": return "main_menu"
-            elif act == "toggle_watched" and idx is not None and 0 <= idx < len(files):
-                toggle_watched_entry(hist_ctx.title, files[idx].name)
-                return _dispatch_result(result, download_mode)
-            elif act == "delete":
-                delete_history_entry(hist_ctx.title)
-                return "main_menu"
-            res_idx = idx
-        else:
-            res_idx = res
-        if res_idx is not None and 0 <= res_idx < len(files):
-            return play_and_browse(selected_file=files[res_idx], current_files=files, initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
+        return play_and_browse(initial_link_base64=result["url"], download_mode=download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "direct_episodes":
         return play_direct_episodes(result["episodes"], result["selected"], download_mode, hist_ctx=hist_ctx)
     elif result["type"] == "worker_folder":
@@ -1880,9 +1884,89 @@ def search(query, download_mode=False):
     return fetch_anime_list(anime_search_url, query=query, download_mode=download_mode)
 
 def signal_handler(sig, frame):
-    exit_alt_screen()
     print("\nExiting...")
     sys.exit(0)
+
+def run_internal_fetch(args):
+    if not args:
+        sys.exit(1)
+    init_session()
+    action = args[0]
+    action_args = args[1:]
+    
+    try:
+        if action == "search":
+            query = " ".join(action_args)
+            res = safe_request('get', search_url + query)
+            if not res:
+                print(f"ERROR: Failed to connect for query '{query}'")
+                sys.exit(1)
+            soup = BeautifulSoup(res.content, 'html.parser')
+            anime_list = soup.select('.post-item-inner > a:first-child')
+            if not anime_list:
+                print("ERROR: No results found.")
+                sys.exit(1)
+            raw_names = [a.get('aria-label', 'Unknown') for a in anime_list]
+            urls = [urljoin(base_url, a['href']) for a in anime_list]
+            for i, (name, url) in enumerate(zip(raw_names, urls)):
+                lbl = format_anime_title_label(name)
+                print(f"{i}\t{lbl}\t{url}\t{name}")
+
+        elif action == "anime_sources":
+            selected_anime_url = action_args[0]
+            raw_title = action_args[1] if len(action_args) > 1 else ""
+            res_anime = safe_request('get', selected_anime_url)
+            if not res_anime:
+                print("ERROR: Failed to fetch anime details.")
+                sys.exit(1)
+            soup = BeautifulSoup(res_anime.content, 'html.parser')
+            anime_title = soup.find('h1', class_="post-title entry-title")
+            page_raw_title = anime_title.get_text().strip() if anime_title else "Unknown"
+            best_raw = raw_title if (raw_title and is_raw_release_title(raw_title)) else (page_raw_title if is_raw_release_title(page_raw_title) else (raw_title if len(raw_title) > len(page_raw_title) else page_raw_title))
+            clean_title, _, _ = parse_anime_title(best_raw)
+            update_history(clean_title, selected_anime_url, raw_title=best_raw)
+
+            cloud_links = soup.css.select('a[href^="//cloud.animetoki.com/"], a[href^="//drive.animetoki.com/"]')
+            cdn_links = [a for a in soup.select('a.shortc-button[href]') if a.get('href') and not (a['href'].startswith('//cloud.animetoki.com/') or a['href'].startswith('//drive.animetoki.com/'))]
+            all_links = list(cloud_links) + list(cdn_links)
+            if not all_links:
+                print("ERROR: No streaming links found for this anime.")
+                sys.exit(1)
+            for i, link in enumerate(all_links):
+                label = link.get_text(strip=True)
+                href = urljoin(base_url, link['href'])
+                link_type = classify_link(href)
+                if link_type == 'cloud':
+                    parsed = urlparse(href)
+                    domain_url = f"https://{parsed.netloc}/"
+                    segments = [base64.b64encode(unquote(s).encode()).decode() for s in parsed.path.split('/') if s]
+                    href = domain_url + "/".join(segments) + "/"
+                lbl = format_item_label(label, link_type)
+                print(f"{i}\t{lbl}\t{label}\t{href}\t{link_type}\t{best_raw}")
+
+        elif action == "cloud_folder":
+            url = action_args[0]
+            files, _ = fetch_content(url)
+            if not files:
+                print("ERROR: No files found in cloud folder.")
+                sys.exit(1)
+            for i, cf in enumerate(files):
+                lbl = format_cloud_file_label(cf)
+                print(f"{i}\t{lbl}\t{cf.name}\t{cf.id}\t{cf.mime_type}\t{cf.node_index}\t{cf.size}")
+
+        elif action == "worker_folder":
+            url = action_args[0]
+            entries = fetch_worker_folder(url)
+            if not entries:
+                print("ERROR: No entries found in worker folder.")
+                sys.exit(1)
+            for i, (label, full_url, link_type) in enumerate(entries):
+                lbl = format_item_label(label, link_type)
+                print(f"{i}\t{lbl}\t{label}\t{full_url}\t{link_type}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -1893,7 +1977,12 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
     parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history")
+    parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.internal_fetch:
+        run_internal_fetch(args.internal_fetch)
+        return
 
     if args.verbose:
         console_handler = logging.StreamHandler()
@@ -1911,12 +2000,10 @@ def main():
     if getattr(args, 'clear_history', False):
         try:
             hist_file.unlink(missing_ok=True)
-        except TypeError: # Python < 3.8 compat
+        except TypeError:
             if hist_file.exists(): hist_file.unlink()
         print("History cleared.")
         return
-
-    enter_alt_screen()
 
     try:
         while True:
@@ -1934,7 +2021,7 @@ def main():
                         args.continue_watch = False
                         continue
                     if isinstance(res, tuple):
-                        act, idx = res
+                        act, idx = res[:2]
                         if idx is not None and 0 <= idx < len(titles):
                             sel_title = titles[idx]
                             if act == "delete":
@@ -1974,8 +2061,6 @@ def main():
         print("\nExiting...")
     except Exception as e:
         print(f"An error occurred: {e}")
-    finally:
-        exit_alt_screen()
 
 if __name__ == "__main__":
     main()
