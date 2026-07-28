@@ -271,7 +271,7 @@ class HistoryStore:
 
     def save_entry(self, title: str, payload: dict) -> None:
         with self._lock:
-            hist = self._cache if self._cache is not None else self._load_from_disk()
+            hist = self._load_from_disk()
             target_url = payload.get("anime_url", "")
             clean_target = parse_anime_title(title)[0]
             
@@ -340,7 +340,7 @@ class HistoryStore:
 
     def delete_entry(self, title: str) -> bool:
         with self._lock:
-            hist = self._cache if self._cache is not None else self._load_from_disk()
+            hist = self._load_from_disk()
             clean_target = parse_anime_title(title)[0]
             keys_to_delete = [k for k in hist.keys() if k == title or parse_anime_title(k)[0] == clean_target]
             if keys_to_delete:
@@ -626,7 +626,7 @@ def save_history_entry(title, payload):
     history_store.save_entry(title, payload)
 
 def load_history():
-    return history_store.get_all()
+    return history_store.get_all(force_reload=True)
 
 def delete_history_entry(title):
     return history_store.delete_entry(title)
@@ -634,19 +634,32 @@ def delete_history_entry(title):
 
 def toggle_watched_entry(title, item_name=None):
     hist = load_history()
-    if not hist or not title:
+    if not title:
         return
     
     clean_t = parse_anime_title(title)[0]
-    entry = hist.get(title)
-    if not isinstance(entry, dict):
-        for k, v in hist.items():
-            if k == title or parse_anime_title(k)[0] == clean_t:
-                entry = v
-                break
+    entry = None
+    if hist:
+        entry = hist.get(title)
+        if not isinstance(entry, dict):
+            for k, v in hist.items():
+                if k == title or parse_anime_title(k)[0] == clean_t:
+                    entry = v
+                    break
 
     if not isinstance(entry, dict):
-        return
+        url = ""
+        cached_search = get_cached_fetch("search:" + clean_t.lower()) or get_cached_fetch("search:" + clean_t)
+        if cached_search and cached_search.get("urls"):
+            url = cached_search["urls"][0]
+        entry = {
+            "anime_url": url,
+            "raw_title": title,
+            "tags": parse_anime_title(title)[2],
+            "last_played": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "watched": [],
+            "version": 1
+        }
 
     watched = list(entry.get("watched", []))
     
