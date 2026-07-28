@@ -1282,27 +1282,26 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
             f"--footer={footer_text}"
         ]
         if reload_cmd:
-            cmd.append(f"--bind=start:reload({reload_cmd})")
             if anime_title:
                 script_path = os.path.abspath(__file__)
                 toggle_cmd = (
                     f"{shlex.quote(sys.executable)} {shlex.quote(script_path)} "
                     f"--internal-fetch toggle_watched {shlex.quote(anime_title)} {{3}}"
                 )
-                cmd.append(f"--bind=ctrl-w:execute({toggle_cmd})+reload({reload_cmd})")
+                cmd.append(f"--bind=ctrl-w:execute({toggle_cmd})+reload({reload_cmd})+down")
             else:
-                cmd.append(f"--bind=ctrl-w:reload({reload_cmd})")
-        else:
-            cmd[12] = "--expect=left,right,ctrl-c,ctrl-d,ctrl-w,ctrl-x"
+                cmd.append(f"--bind=ctrl-w:reload({reload_cmd})+down")
 
         if header:
             cmd.append(f"--header={header}")
         if default_idx is not None and default_idx >= 0:
             pos_str = str(default_idx + 1)
             if reload_cmd:
-                cmd.append(f"--bind=load:pos({pos_str})")
+                cmd.append(f"--bind=start:reload({reload_cmd})+pos({pos_str})")
             else:
-                cmd.append(f"--bind=start:pos({pos_str}),load:pos({pos_str})")
+                cmd.append(f"--bind=start:pos({pos_str})")
+        elif reload_cmd:
+            cmd.append(f"--bind=start:reload({reload_cmd})")
             
         text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
         p = subprocess.run(cmd, input=text if not reload_cmd else None, text=True, capture_output=True)
@@ -1964,6 +1963,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
                 elif act == "toggle_watched":
                     if hist_ctx and idx is not None and 0 <= idx < len(entries):
                         toggle_watched_entry(hist_ctx.title, entries[idx][0])
+                        first_unwatched_idx = min(idx + 1, len(entries) - 1)
                     continue
                 elif act == "delete":
                     if hist_ctx:
@@ -2033,6 +2033,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
             if act == "main_menu": return "main_menu"
             elif act == "toggle_watched":
                 if hist_ctx: toggle_watched_entry(hist_ctx.title, episodes[idx][0])
+                idx = min(idx + 1, len(episodes) - 1)
             elif act == "delete":
                 if hist_ctx: delete_history_entry(hist_ctx.title)
                 return "main_menu"
@@ -2071,6 +2072,7 @@ def play_direct_episodes(episodes, selected_idx, download_mode=False, hist_ctx=N
                 if a_type == "main_menu": return "main_menu"
                 elif a_type == "toggle_watched":
                     if hist_ctx: toggle_watched_entry(hist_ctx.title, episodes[idx][0])
+                    idx = min(idx + 1, len(episodes) - 1)
                 elif a_type == "delete":
                     if hist_ctx: delete_history_entry(hist_ctx.title)
                     return "main_menu"
@@ -2183,8 +2185,9 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
                     if act == "main_menu":
                         return "main_menu"
                     elif act == "toggle_watched":
-                        if hist_ctx and idx is not None:
+                        if hist_ctx and idx is not None and 0 <= idx < len(files):
                             toggle_watched_entry(hist_ctx.title, files[idx].name)
+                            first_unwatched_idx = min(idx + 1, len(files) - 1)
                         continue
                     elif act == "delete":
                         if hist_ctx:
@@ -2329,7 +2332,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Show debug log output in terminal")
     parser.add_argument("-c", "--continue-watch", action="store_true", help="Continue watching from history")
     parser.add_argument("-C", "--clear-history", action="store_true", help="Clear watch history (and exit)")
-    parser.add_argument("--version", action="version", version="anitokiPy 2.1")
+    parser.add_argument("--version", action="version", version="anitokiPy 2.3")
     parser.add_argument("--internal-fetch", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
