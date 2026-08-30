@@ -5,7 +5,7 @@ Stream/Download anime from [animetoki.com](https://animetoki.com/) on terminal.
 ## Dependencies
 
 - **`mpv`**: Video playback
-- **`fzf`**: Interactive selection (optional)
+- **`fzf`**: Interactive selection (optional, version >= 0.74.3)
 - **`curl`**: File downloads
 
 ## Installation & Usage

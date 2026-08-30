@@ -1282,26 +1282,38 @@ def flush_stdin():
         except Exception:
             pass
 
-_FZF_VER = None
+MIN_FZF_VERSION = (0, 74, 3)
+_fzf_checked = False
+_fzf_supported = False
 
-def get_fzf_version():
-    global _FZF_VER
-    if _FZF_VER is not None:
-        return _FZF_VER
-    if not shutil.which("fzf"):
-        _FZF_VER = (0, 0, 0)
-        return _FZF_VER
+def is_fzf_supported() -> bool:
+    global _fzf_checked, _fzf_supported
+    if _fzf_checked:
+        return _fzf_supported
+
+    _fzf_checked = True
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and shutil.which("fzf")):
+        _fzf_supported = False
+        return False
+
     try:
         p = subprocess.run(["fzf", "--version"], capture_output=True, text=True, timeout=2)
         if p.returncode == 0 and p.stdout:
             m = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', p.stdout)
             if m:
-                _FZF_VER = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
-                return _FZF_VER
-    except Exception:
-        pass
-    _FZF_VER = (0, 0, 0)
-    return _FZF_VER
+                ver = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+                if ver >= MIN_FZF_VERSION:
+                    _fzf_supported = True
+                    return True
+                else:
+                    ver_str = f"{ver[0]}.{ver[1]}.{ver[2]}"
+                    min_ver_str = f"{MIN_FZF_VERSION[0]}.{MIN_FZF_VERSION[1]}.{MIN_FZF_VERSION[2]}"
+                    print(f"\033[33mWarning: Detected fzf v{ver_str} (< v{min_ver_str}). Please update fzf to >= v{min_ver_str} for interactive UI support. Falling back to non-fzf mode.\033[0m\n")
+    except Exception as e:
+        logger.debug(f"Error checking fzf version: {e}")
+
+    _fzf_supported = False
+    return False
 
 def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, footer=None, reload_cmd=None, anime_title=None):
     flush_stdin()
@@ -1312,41 +1324,24 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
     else:
         footer_text = build_footer([("Enter / →", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
 
-    if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-        ver = get_fzf_version()
+    if is_fzf_supported():
         cmd = [
             "fzf",
             "--ansi",
+            "--border=rounded",
+            "--border-label= AnimeToki CLI ",
+            "--info=inline: ",
+            "--height=100%",
+            "--header-border=bottom",
+            "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
             "--reverse",
             "--cycle",
             "--prompt", prompt,
             "--with-nth=2",
             "--delimiter=\t",
             "--expect=left,right,ctrl-c,ctrl-d,ctrl-x,ctrl-w",
-            "--height=100%"
+            f"--footer={footer_text}"
         ]
-        if ver >= (0, 24, 0):
-            cmd.append("--border=rounded")
-        if ver >= (0, 35, 0):
-            cmd.append("--border-label= AnimeToki CLI ")
-        if ver >= (0, 42, 0):
-            cmd.append("--info=inline: ")
-        elif ver >= (0, 23, 0):
-            cmd.append("--info=inline")
-
-        if ver >= (0, 40, 0):
-            cmd.append("--header-border=bottom")
-            cmd.append("--color=prompt:cyan:bold,header:247,footer:247,header-border:247")
-            if footer_text:
-                cmd.append(f"--footer={footer_text}")
-            if header:
-                cmd.append(f"--header={header}")
-        else:
-            cmd.append("--color=prompt:cyan:bold,header:247")
-            full_h = f"{header}\n{footer_text}" if (header and footer_text) else (header or footer_text or "")
-            if full_h:
-                cmd.append(f"--header={full_h}")
-
         if reload_cmd:
             if anime_title:
                 script_path = os.path.abspath(__file__)
@@ -1358,35 +1353,19 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
             else:
                 cmd.append(f"--bind=ctrl-w:reload({reload_cmd})+down")
 
-        input_text = None
-        if ver >= (0, 44, 0):
-            if default_idx is not None and default_idx >= 0:
-                pos_str = str(default_idx + 1)
-                if reload_cmd:
-                    cmd.append(f"--bind=start:reload({reload_cmd}),load:pos({pos_str})+unbind(load)")
-                else:
-                    cmd.append(f"--bind=start:pos({pos_str})")
-            elif reload_cmd:
-                cmd.append(f"--bind=start:reload({reload_cmd})")
-            if not reload_cmd:
-                input_text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
-        elif ver >= (0, 42, 0):
+        if header:
+            cmd.append(f"--header={header}")
+        if default_idx is not None and default_idx >= 0:
+            pos_str = str(default_idx + 1)
             if reload_cmd:
-                cmd.append(f"--bind=start:reload({reload_cmd})")
-            if not reload_cmd:
-                input_text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
-        else:
-            if reload_cmd and items is None:
-                try:
-                    proc = subprocess.run(shlex.split(reload_cmd), capture_output=True, text=True)
-                    if proc.returncode == 0 and proc.stdout:
-                        input_text = proc.stdout
-                except Exception as e:
-                    logger.debug(f"Failed pre-fetching reload_cmd for fzf: {e}")
-            if input_text is None and items:
-                input_text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items))
+                cmd.append(f"--bind=start:reload({reload_cmd}),load:pos({pos_str})+unbind(load)")
+            else:
+                cmd.append(f"--bind=start:pos({pos_str})")
+        elif reload_cmd:
+            cmd.append(f"--bind=start:reload({reload_cmd})")
 
-        p = subprocess.run(cmd, input=input_text if input_text is not None else (None if reload_cmd else ""), text=True, capture_output=True)
+        text = "\n".join(f"{i}\t{x}" for i, x in enumerate(items)) if items else ""
+        p = subprocess.run(cmd, input=text if not reload_cmd else None, text=True, capture_output=True)
         if p.returncode == 130:
             return None
         if p.stdout:
@@ -1418,22 +1397,7 @@ def fzf_select(items=None, prompt="Select: ", default_idx=None, header=None, foo
                     return None
                 elif selected_idx is not None or raw_parts:
                     return (selected_idx, raw_parts) if raw_parts else selected_idx
-
-        if p.returncode not in (0, 1, 130):
-            logger.debug(f"fzf select error (code {p.returncode}): {p.stderr}")
-
-    if not items and reload_cmd:
-        try:
-            proc = subprocess.run(shlex.split(reload_cmd), capture_output=True, text=True)
-            if proc.returncode == 0 and proc.stdout:
-                parsed_items = []
-                for line in proc.stdout.splitlines():
-                    parts = line.split('\t')
-                    if len(parts) > 1:
-                        parsed_items.append(parts[1])
-                items = parsed_items
-        except Exception:
-            pass
+        return None
 
     if not items:
         return None
@@ -1472,8 +1436,7 @@ def parse_fzf_result(res):
 
 def fzf_search_prompt():
     flush_stdin()
-    if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
-        ver = get_fzf_version()
+    if is_fzf_supported():
         while True:
             hist = load_history()
             hist_titles = list(hist.keys())
@@ -1493,34 +1456,20 @@ def fzf_search_prompt():
             cmd = [
                 "fzf",
                 "--ansi",
+                "--border=rounded",
+                "--border-label= AnimeToki CLI ",
+                "--info=inline: ",
+                "--height=100%",
+                "--header-border=bottom",
+                "--color=prompt:cyan:bold,header:247,footer:247,header-border:247",
                 "--reverse",
                 "--cycle",
                 "--print-query",
                 "--prompt=  > ",
                 "--expect=left,ctrl-c,ctrl-d,ctrl-w,ctrl-x",
-                "--height=100%"
+                f"--header={header}",
+                f"--footer={footer}"
             ]
-            if ver >= (0, 24, 0):
-                cmd.append("--border=rounded")
-            if ver >= (0, 35, 0):
-                cmd.append("--border-label= AnimeToki CLI ")
-            if ver >= (0, 42, 0):
-                cmd.append("--info=inline: ")
-            elif ver >= (0, 23, 0):
-                cmd.append("--info=inline")
-
-            if ver >= (0, 40, 0):
-                cmd.append("--header-border=bottom")
-                cmd.append("--color=prompt:cyan:bold,header:247,footer:247,header-border:247")
-                if header:
-                    cmd.append(f"--header={header}")
-                if footer:
-                    cmd.append(f"--footer={footer}")
-            else:
-                cmd.append("--color=prompt:cyan:bold,header:247")
-                full_h = f"{header}\n{footer}" if (header and footer) else (header or footer or "")
-                if full_h:
-                    cmd.append(f"--header={full_h}")
             
             text = "\n".join(items) if items else ""
             p = subprocess.run(cmd, input=text, text=True, capture_output=True)
@@ -1730,7 +1679,7 @@ def download_file(url, output_name):
         print("curl is not installed. Cannot download.")
 
 def fetch_anime_list(anime_search_url, query=None, download_mode=False):
-    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    use_fzf = is_fzf_supported()
     path_parts = ['search', query] if query else ['search']
     header_title = build_header(path_parts)
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
@@ -1846,7 +1795,7 @@ def resolve_stream_url(url):
     return url
 
 def anime_download_link(selected_anime_url, download_mode=False, raw_title=""):
-    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    use_fzf = is_fzf_supported()
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
     path_parts = [raw_title or selected_anime_url]
     header = build_header(path_parts)
@@ -2018,7 +1967,7 @@ def browse_worker_folder(url, download_mode=False, hist_ctx=None, resume_from=No
         display_stack = [anime_title, source_label]
 
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
-    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    use_fzf = is_fzf_supported()
 
     while True:
         header = build_header(display_stack)
@@ -2212,7 +2161,7 @@ def play_and_browse(selected_file=None, current_files=None, initial_link_base64=
         return f"{domain_url}?a=download&id={cf.id}&name={base64.b64encode(unquote(cf.name).encode()).decode()}&n={cf.node_index}"
 
     footer = build_footer([("Enter", "Select"), ("ESC / ←", "Back"), ("Ctrl+W", "Watched"), ("Ctrl+X", "Main Menu"), ("Ctrl+C", "Exit")])
-    use_fzf = shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty()
+    use_fzf = is_fzf_supported()
 
     if resume_from:
         current_folder_url = resume_from["current_folder_url"]
