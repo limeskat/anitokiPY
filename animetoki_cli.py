@@ -1403,6 +1403,10 @@ def parse_fzf_result(res):
 
 def fzf_search_prompt():
     flush_stdin()
+    cols, _ = shutil.get_terminal_size((80, 24))
+    print("\033[1;36m" + "═"*min(cols, 60) + "\033[0m")
+    print("\033[1;33m ANIMETOKI-CLI  │  Your Terminal Anime Streaming Client\033[0m")
+    print("\033[1;36m" + "═"*min(cols, 60) + "\033[0m")
     if shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty():
         while True:
             hist = load_history()
@@ -1481,7 +1485,6 @@ def fzf_search_prompt():
                     return ("history", (real_title, hist[real_title]))
                         
             continue
-    
     try:
         query = input("\033[1;36m> \033[0m").strip()
         if not query or query.lower() in ("exit", "quit"):
